@@ -1,0 +1,569 @@
+"""CertWatch FastAPI application: REST API, scheduler bootstrap, static frontend.
+
+AUTHORIZATION NOTICE: CertWatch is for authorized internal inventory only. Only
+define targets for networks and hosts you are authorized to assess.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from contextlib import asynccontextmanager
+from datetime import timedelta
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from sqlalchemy import String, cast, func, or_, select
+from sqlalchemy.orm import Session
+
+from . import schemas, targets as target_lib
+from .alerts import dispatch_alerts, evaluate_alerts
+from .config import settings
+from .db import get_db, init_db
+from .models import (
+    AlertEvent,
+    AuditLog,
+    Certificate,
+    CertificateObservation,
+    Endpoint,
+    NotificationChannel,
+    ScanJob,
+    SystemSetting,
+    Target,
+    utcnow,
+)
+from .notify import NotifyError, send_email, send_webhook
+from .scheduler import enqueue_scan, shutdown_scheduler, start_scheduler
+from .serialize import cert_dict, endpoint_dict, observation_dict
+from .status import days_until
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+log = logging.getLogger("certwatch")
+
+DEFAULT_SETTINGS = {
+    "scan_failure_threshold": 3,
+    "alert_on_self_signed": False,
+    "app_base_url": "http://localhost:5173",
+    "default_ports": [443, 8443, 9443, 636, 993, 995, 465, 587, 3389, 5986],
+}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    _seed_settings()
+    if settings.enable_scheduler:
+        start_scheduler()
+    yield
+    shutdown_scheduler()
+
+
+app = FastAPI(title="CertWatch", version="1.0.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def _seed_settings() -> None:
+    from .db import SessionLocal
+    db = SessionLocal()
+    try:
+        for key, value in DEFAULT_SETTINGS.items():
+            if db.get(SystemSetting, key) is None:
+                db.add(SystemSetting(key=key, value={"value": value}))
+        db.commit()
+    finally:
+        db.close()
+
+
+def require_auth(authorization: str = Header(default="")) -> None:
+    """Optional bearer-token guard. Open when CERTWATCH_API_KEY is unset."""
+    if not settings.api_key:
+        return
+    token = authorization.removeprefix("Bearer ").strip()
+    if token != settings.api_key:
+        raise HTTPException(status_code=401, detail="invalid or missing API key")
+
+
+def audit(db: Session, action: str, entity: str, entity_id, detail: str = "") -> None:
+    db.add(AuditLog(action=action, entity=entity, entity_id=str(entity_id), detail=detail))
+
+
+# --------------------------------------------------------------------------- #
+# Health
+# --------------------------------------------------------------------------- #
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "service": "certwatch"}
+
+
+# --------------------------------------------------------------------------- #
+# Targets
+# --------------------------------------------------------------------------- #
+def _target_out(db: Session, t: Target) -> dict:
+    count = db.scalar(select(func.count(Endpoint.id)).where(Endpoint.target_id == t.id)) or 0
+    out = schemas.TargetOut.model_validate(t).model_dump()
+    out["endpoint_count"] = count
+    return out
+
+
+@app.get("/api/targets", dependencies=[Depends(require_auth)])
+def list_targets(db: Session = Depends(get_db)):
+    return [_target_out(db, t) for t in db.scalars(select(Target).order_by(Target.name)).all()]
+
+
+@app.post("/api/targets/validate", dependencies=[Depends(require_auth)])
+def validate_target(body: schemas.TargetIn):
+    try:
+        count = target_lib.validate(body.target_type, body.value, settings.max_cidr_hosts)
+        ports = target_lib.normalize_ports(body.ports, settings.default_ports)
+    except target_lib.TargetError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    endpoints = count * len(ports)
+    return {
+        "host_count": count,
+        "port_count": len(ports),
+        "endpoint_count": endpoints,
+        "large_scan": endpoints > 256,
+    }
+
+
+@app.post("/api/targets", dependencies=[Depends(require_auth)], status_code=201)
+def create_target(body: schemas.TargetIn, db: Session = Depends(get_db)):
+    try:
+        target_lib.validate(body.target_type, body.value, settings.max_cidr_hosts)
+        ports = target_lib.normalize_ports(body.ports, settings.default_ports)
+    except target_lib.TargetError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    data = body.model_dump()
+    data["ports"] = ports
+    t = Target(**data)
+    db.add(t)
+    db.flush()
+    audit(db, "target.create", "target", t.id, t.name)
+    db.commit()
+    return _target_out(db, t)
+
+
+@app.get("/api/targets/{target_id}", dependencies=[Depends(require_auth)])
+def get_target(target_id: int, db: Session = Depends(get_db)):
+    t = db.get(Target, target_id)
+    if not t:
+        raise HTTPException(404, "target not found")
+    return _target_out(db, t)
+
+
+@app.put("/api/targets/{target_id}", dependencies=[Depends(require_auth)])
+def update_target(target_id: int, body: schemas.TargetIn, db: Session = Depends(get_db)):
+    t = db.get(Target, target_id)
+    if not t:
+        raise HTTPException(404, "target not found")
+    try:
+        target_lib.validate(body.target_type, body.value, settings.max_cidr_hosts)
+        ports = target_lib.normalize_ports(body.ports, settings.default_ports)
+    except target_lib.TargetError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    for k, v in body.model_dump().items():
+        setattr(t, k, v)
+    t.ports = ports
+    audit(db, "target.update", "target", t.id, t.name)
+    db.commit()
+    return _target_out(db, t)
+
+
+@app.delete("/api/targets/{target_id}", dependencies=[Depends(require_auth)], status_code=204)
+def delete_target(target_id: int, db: Session = Depends(get_db)):
+    t = db.get(Target, target_id)
+    if not t:
+        raise HTTPException(404, "target not found")
+    audit(db, "target.delete", "target", t.id, t.name)
+    db.delete(t)
+    db.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Scan jobs
+# --------------------------------------------------------------------------- #
+@app.post("/api/targets/{target_id}/scan", dependencies=[Depends(require_auth)], status_code=202)
+def start_scan(target_id: int, db: Session = Depends(get_db)):
+    t = db.get(Target, target_id)
+    if not t:
+        raise HTTPException(404, "target not found")
+    job = enqueue_scan(db, t, trigger="manual")
+    return schemas.ScanJobOut.model_validate(job).model_dump()
+
+
+@app.post("/api/scans/{job_id}/cancel", dependencies=[Depends(require_auth)])
+def cancel_scan(job_id: int, db: Session = Depends(get_db)):
+    job = db.get(ScanJob, job_id)
+    if not job:
+        raise HTTPException(404, "scan job not found")
+    if job.status in ("pending", "running"):
+        job.cancel_requested = True
+        db.commit()
+    return schemas.ScanJobOut.model_validate(job).model_dump()
+
+
+@app.get("/api/scans", dependencies=[Depends(require_auth)])
+def list_scans(limit: int = Query(50, le=500), db: Session = Depends(get_db)):
+    jobs = db.scalars(select(ScanJob).order_by(ScanJob.id.desc()).limit(limit)).all()
+    return [schemas.ScanJobOut.model_validate(j).model_dump() for j in jobs]
+
+
+@app.get("/api/scans/{job_id}", dependencies=[Depends(require_auth)])
+def get_scan(job_id: int, db: Session = Depends(get_db)):
+    job = db.get(ScanJob, job_id)
+    if not job:
+        raise HTTPException(404, "scan job not found")
+    return schemas.ScanJobOut.model_validate(job).model_dump()
+
+
+# --------------------------------------------------------------------------- #
+# Certificates (deduplicated by fingerprint)
+# --------------------------------------------------------------------------- #
+@app.get("/api/certificates", dependencies=[Depends(require_auth)])
+def list_certificates(
+    q: str = "",
+    expiring_within: int | None = None,
+    expired: bool | None = None,
+    self_signed: bool | None = None,
+    issuer: str = "",
+    sort: str = "not_after",
+    limit: int = Query(100, le=1000),
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    stmt = select(Certificate)
+    if q:
+        like = f"%{q.lower()}%"
+        stmt = stmt.where(or_(
+            func.lower(Certificate.common_name).like(like),
+            func.lower(Certificate.fingerprint_sha256).like(like),
+            func.lower(Certificate.issuer).like(like),
+            func.lower(cast(Certificate.sans, String)).like(like),
+        ))
+    if issuer:
+        stmt = stmt.where(func.lower(Certificate.issuer_cn).like(f"%{issuer.lower()}%"))
+    if self_signed is not None:
+        stmt = stmt.where(Certificate.self_signed.is_(self_signed))
+    now = utcnow()
+    if expired:
+        stmt = stmt.where(Certificate.not_after < now)
+    if expiring_within is not None:
+        stmt = stmt.where(Certificate.not_after >= now,
+                          Certificate.not_after <= now + timedelta(days=expiring_within))
+    total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+
+    order = Certificate.not_after.asc() if sort == "not_after" else Certificate.common_name.asc()
+    rows = db.scalars(stmt.order_by(order).limit(limit).offset(offset)).all()
+    return {"total": total, "items": [cert_dict(db, c) for c in rows]}
+
+
+@app.get("/api/certificates/{cert_id}", dependencies=[Depends(require_auth)])
+def get_certificate(cert_id: int, db: Session = Depends(get_db)):
+    c = db.get(Certificate, cert_id)
+    if not c:
+        raise HTTPException(404, "certificate not found")
+    out = cert_dict(db, c, with_endpoints=True)
+    # observation history across all endpoints bound to this cert
+    obs = db.scalars(
+        select(CertificateObservation)
+        .where(CertificateObservation.certificate_id == cert_id)
+        .order_by(CertificateObservation.observed_at.desc()).limit(200)
+    ).all()
+    out["observations"] = [observation_dict(o) for o in obs]
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Endpoints
+# --------------------------------------------------------------------------- #
+@app.get("/api/endpoints", dependencies=[Depends(require_auth)])
+def list_endpoints(
+    q: str = "",
+    status: str = "",
+    environment: str = "",
+    owner: str = "",
+    port: int | None = None,
+    failed: bool | None = None,
+    limit: int = Query(200, le=2000),
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    stmt = select(Endpoint)
+    if q:
+        like = f"%{q.lower()}%"
+        stmt = stmt.where(or_(
+            func.lower(Endpoint.host).like(like),
+            func.lower(Endpoint.ip).like(like),
+        ))
+    if status:
+        stmt = stmt.where(Endpoint.last_status == status)
+    if failed:
+        stmt = stmt.where(Endpoint.last_status != "ok", Endpoint.last_status != "")
+    if port:
+        stmt = stmt.where(Endpoint.port == port)
+    if environment or owner:
+        stmt = stmt.join(Target, Endpoint.target_id == Target.id)
+        if environment:
+            stmt = stmt.where(Target.environment == environment)
+        if owner:
+            stmt = stmt.where(func.lower(Target.owner).like(f"%{owner.lower()}%"))
+    total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows = db.scalars(stmt.order_by(Endpoint.id.desc()).limit(limit).offset(offset)).all()
+    return {"total": total, "items": [endpoint_dict(db, e, with_cert=False) for e in rows]}
+
+
+@app.get("/api/endpoints/{endpoint_id}", dependencies=[Depends(require_auth)])
+def get_endpoint(endpoint_id: int, db: Session = Depends(get_db)):
+    ep = db.get(Endpoint, endpoint_id)
+    if not ep:
+        raise HTTPException(404, "endpoint not found")
+    out = endpoint_dict(db, ep, with_cert=True)
+    obs = db.scalars(
+        select(CertificateObservation)
+        .where(CertificateObservation.endpoint_id == endpoint_id)
+        .order_by(CertificateObservation.observed_at.desc()).limit(100)
+    ).all()
+    out["observations"] = [observation_dict(o) for o in obs]
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Alerts
+# --------------------------------------------------------------------------- #
+def _alert_dict(db: Session, ev: AlertEvent) -> dict:
+    ep = db.get(Endpoint, ev.endpoint_id) if ev.endpoint_id else None
+    cert = db.get(Certificate, ev.certificate_id) if ev.certificate_id else None
+    return {
+        "id": ev.id,
+        "rule_type": ev.rule_type,
+        "severity": ev.severity,
+        "threshold_days": ev.threshold_days,
+        "message": ev.message,
+        "endpoint_id": ev.endpoint_id,
+        "endpoint": f"{ep.host or ep.ip}:{ep.port}" if ep else "",
+        "certificate_id": ev.certificate_id,
+        "common_name": cert.common_name if cert else "",
+        "acknowledged": ev.acknowledged,
+        "muted": ev.muted,
+        "muted_until": ev.muted_until,
+        "resolved": ev.resolved,
+        "notify_count": ev.notify_count,
+        "last_notified_at": ev.last_notified_at,
+        "created_at": ev.created_at,
+    }
+
+
+@app.get("/api/alerts", dependencies=[Depends(require_auth)])
+def list_alerts(include_resolved: bool = False, db: Session = Depends(get_db)):
+    stmt = select(AlertEvent).order_by(AlertEvent.updated_at.desc())
+    if not include_resolved:
+        stmt = stmt.where(AlertEvent.resolved.is_(False))
+    return [_alert_dict(db, e) for e in db.scalars(stmt).all()]
+
+
+@app.post("/api/alerts/{alert_id}/ack", dependencies=[Depends(require_auth)])
+def ack_alert(alert_id: int, db: Session = Depends(get_db)):
+    ev = db.get(AlertEvent, alert_id)
+    if not ev:
+        raise HTTPException(404, "alert not found")
+    ev.acknowledged = True
+    db.commit()
+    return _alert_dict(db, ev)
+
+
+@app.post("/api/alerts/{alert_id}/mute", dependencies=[Depends(require_auth)])
+def mute_alert(alert_id: int, body: schemas.AlertActionIn, db: Session = Depends(get_db)):
+    ev = db.get(AlertEvent, alert_id)
+    if not ev:
+        raise HTTPException(404, "alert not found")
+    ev.muted = True
+    ev.muted_until = utcnow() + timedelta(hours=body.mute_hours) if body.mute_hours else None
+    db.commit()
+    return _alert_dict(db, ev)
+
+
+@app.post("/api/alerts/{alert_id}/unmute", dependencies=[Depends(require_auth)])
+def unmute_alert(alert_id: int, db: Session = Depends(get_db)):
+    ev = db.get(AlertEvent, alert_id)
+    if not ev:
+        raise HTTPException(404, "alert not found")
+    ev.muted = False
+    ev.muted_until = None
+    db.commit()
+    return _alert_dict(db, ev)
+
+
+@app.post("/api/alerts/evaluate", dependencies=[Depends(require_auth)])
+def evaluate(db: Session = Depends(get_db)):
+    return evaluate_alerts(db)
+
+
+# --------------------------------------------------------------------------- #
+# Notification channels
+# --------------------------------------------------------------------------- #
+_SECRET_KEYS = {"password", "url"}
+
+
+def _channel_out(ch: NotificationChannel) -> dict:
+    summary = {k: v for k, v in (ch.config or {}).items() if k not in _SECRET_KEYS}
+    if "url" in (ch.config or {}):
+        summary["url_set"] = bool(ch.config.get("url"))
+    if "password" in (ch.config or {}):
+        summary["password_set"] = bool(ch.config.get("password"))
+    return {
+        "id": ch.id, "name": ch.name, "channel_type": ch.channel_type,
+        "enabled": ch.enabled, "re_alert_hours": ch.re_alert_hours, "config_summary": summary,
+    }
+
+
+@app.get("/api/channels", dependencies=[Depends(require_auth)])
+def list_channels(db: Session = Depends(get_db)):
+    return [_channel_out(c) for c in db.scalars(select(NotificationChannel)).all()]
+
+
+@app.post("/api/channels", dependencies=[Depends(require_auth)], status_code=201)
+def create_channel(body: schemas.ChannelIn, db: Session = Depends(get_db)):
+    ch = NotificationChannel(**body.model_dump())
+    db.add(ch)
+    db.flush()
+    audit(db, "channel.create", "channel", ch.id, ch.name)
+    db.commit()
+    return _channel_out(ch)
+
+
+@app.put("/api/channels/{channel_id}", dependencies=[Depends(require_auth)])
+def update_channel(channel_id: int, body: schemas.ChannelIn, db: Session = Depends(get_db)):
+    ch = db.get(NotificationChannel, channel_id)
+    if not ch:
+        raise HTTPException(404, "channel not found")
+    # Merge config so a blank secret doesn't wipe an existing one.
+    new_config = dict(ch.config or {})
+    for k, v in body.config.items():
+        if k in _SECRET_KEYS and v == "":
+            continue  # keep existing secret
+        new_config[k] = v
+    ch.name, ch.channel_type, ch.enabled, ch.re_alert_hours = (
+        body.name, body.channel_type, body.enabled, body.re_alert_hours)
+    ch.config = new_config
+    audit(db, "channel.update", "channel", ch.id, ch.name)
+    db.commit()
+    return _channel_out(ch)
+
+
+@app.delete("/api/channels/{channel_id}", dependencies=[Depends(require_auth)], status_code=204)
+def delete_channel(channel_id: int, db: Session = Depends(get_db)):
+    ch = db.get(NotificationChannel, channel_id)
+    if not ch:
+        raise HTTPException(404, "channel not found")
+    audit(db, "channel.delete", "channel", ch.id, ch.name)
+    db.delete(ch)
+    db.commit()
+
+
+@app.post("/api/channels/{channel_id}/test", dependencies=[Depends(require_auth)])
+def test_channel(channel_id: int, db: Session = Depends(get_db)):
+    ch = db.get(NotificationChannel, channel_id)
+    if not ch:
+        raise HTTPException(404, "channel not found")
+    try:
+        if ch.channel_type == "smtp":
+            send_email(ch.config, "CertWatch test email",
+                       "This is a test notification from CertWatch. SMTP is configured correctly.")
+        else:
+            send_webhook(ch.config, "CertWatch test notification",
+                         "This is a test notification from CertWatch. The webhook is configured correctly.",
+                         {"Channel": ch.name}, _base_url(db))
+    except NotifyError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "sent"}
+
+
+# --------------------------------------------------------------------------- #
+# Settings
+# --------------------------------------------------------------------------- #
+def _base_url(db: Session) -> str:
+    row = db.get(SystemSetting, "app_base_url")
+    return row.value.get("value") if row else "http://localhost:5173"
+
+
+@app.get("/api/settings", dependencies=[Depends(require_auth)])
+def get_settings(db: Session = Depends(get_db)):
+    rows = db.scalars(select(SystemSetting)).all()
+    return {r.key: r.value.get("value") for r in rows}
+
+
+@app.put("/api/settings", dependencies=[Depends(require_auth)])
+def update_settings(body: dict, db: Session = Depends(get_db)):
+    for key, value in body.items():
+        row = db.get(SystemSetting, key)
+        if row is None:
+            db.add(SystemSetting(key=key, value={"value": value}))
+        else:
+            row.value = {"value": value}
+    audit(db, "settings.update", "settings", "-", ",".join(body.keys()))
+    db.commit()
+    return get_settings(db)
+
+
+# --------------------------------------------------------------------------- #
+# Dashboard
+# --------------------------------------------------------------------------- #
+@app.get("/api/dashboard", dependencies=[Depends(require_auth)])
+def dashboard(db: Session = Depends(get_db)):
+    now = utcnow()
+    total_certs = db.scalar(select(func.count(Certificate.id))) or 0
+    total_endpoints = db.scalar(select(func.count(Endpoint.id))) or 0
+
+    def count_window(days):
+        return db.scalar(select(func.count(Certificate.id)).where(
+            Certificate.not_after >= now, Certificate.not_after <= now + timedelta(days=days))) or 0
+
+    expired = db.scalar(select(func.count(Certificate.id)).where(Certificate.not_after < now)) or 0
+    failed = db.scalar(select(func.count(Endpoint.id)).where(
+        Endpoint.last_status != "ok", Endpoint.last_status != "")) or 0
+    changed = db.scalar(select(func.count(CertificateObservation.id)).where(
+        CertificateObservation.change_status == "changed",
+        CertificateObservation.observed_at >= now - timedelta(days=7))) or 0
+    open_alerts = db.scalar(select(func.count(AlertEvent.id)).where(AlertEvent.resolved.is_(False))) or 0
+
+    last_ok = db.scalar(select(func.max(ScanJob.finished_at)).where(ScanJob.status == "completed"))
+    next_target = db.scalars(select(Target).where(Target.enabled.is_(True))).all()
+    next_scan = None
+    for t in next_target:
+        nxt = (t.last_scanned_at + timedelta(minutes=t.scan_frequency_minutes)) if t.last_scanned_at else now
+        if next_scan is None or nxt < next_scan:
+            next_scan = nxt
+
+    return {
+        "total_certificates": total_certs,
+        "total_endpoints": total_endpoints,
+        "expiring_90d": count_window(90),
+        "expiring_30d": count_window(30),
+        "expiring_7d": count_window(7),
+        "expired": expired,
+        "failed_scans": failed,
+        "recently_changed": changed,
+        "open_alerts": open_alerts,
+        "last_successful_scan": last_ok,
+        "next_scheduled_scan": next_scan,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Static frontend (production) — must be mounted last so /api wins.
+# --------------------------------------------------------------------------- #
+if settings.static_dir and os.path.isdir(settings.static_dir):
+    static_dir = settings.static_dir
+
+    @app.get("/{full_path:path}")
+    def spa(full_path: str):
+        candidate = os.path.join(static_dir, full_path)
+        if full_path and os.path.isfile(candidate):
+            return FileResponse(candidate)
+        return FileResponse(os.path.join(static_dir, "index.html"))

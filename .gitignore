@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.db
+*.sqlite3
+
+# Node / frontend
+node_modules/
+frontend/dist/
+
+# Env / secrets
+.env
+
+# OS / editor
+.DS_Store
+*.log
+
+# Sibling reference project (CipherGap) — not part of CertWatch
+/CipherGap/

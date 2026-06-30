@@ -1,0 +1,29 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-certwatch}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-certwatch}
+      POSTGRES_DB: ${POSTGRES_DB:-certwatch}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-certwatch}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    env_file:
+      - .env
+    environment:
+      CERTWATCH_DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-certwatch}:${POSTGRES_PASSWORD:-certwatch}@db:5432/${POSTGRES_DB:-certwatch}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
