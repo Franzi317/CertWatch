@@ -28,7 +28,8 @@ export const api = {
 export interface Target {
   id: number; name: string; description: string; target_type: string; value: string;
   ports: number[]; environment: string; owner: string; tags: string[];
-  scan_frequency_minutes: number; timeout: number; concurrency: number; enabled: boolean;
+  scan_frequency_minutes: number; schedule_type: string; schedule_time: string; schedule_day: number;
+  timeout: number; concurrency: number; enabled: boolean;
   alert_thresholds: number[]; use_sni: boolean; last_scanned_at: string | null; endpoint_count: number;
 }
 export interface ScanJob {
@@ -40,7 +41,7 @@ export interface Cert {
   id: number; fingerprint_sha256: string; common_name: string; subject: string; sans: string[];
   issuer: string; issuer_cn: string; serial_number: string; signature_algorithm: string;
   public_key_algorithm: string; public_key_size: number | null; not_before: string | null;
-  not_after: string | null; self_signed: boolean; is_wildcard: boolean; is_ca: boolean;
+  not_after: string | null; self_signed: boolean; internal_issued: boolean; is_wildcard: boolean; is_ca: boolean;
   chain_length: number; first_seen: string; last_seen: string; days_until_expiry: number | null;
   expired: boolean; severity: string; expiry_phrase: string; endpoint_count: number;
   pem?: string; endpoints?: Endpoint[]; observations?: Observation[];

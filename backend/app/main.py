@@ -231,6 +231,7 @@ def list_certificates(
     expiring_within: int | None = None,
     expired: bool | None = None,
     self_signed: bool | None = None,
+    internal: bool | None = None,
     issuer: str = "",
     sort: str = "not_after",
     limit: int = Query(100, le=1000),
@@ -250,6 +251,13 @@ def list_certificates(
         stmt = stmt.where(func.lower(Certificate.issuer_cn).like(f"%{issuer.lower()}%"))
     if self_signed is not None:
         stmt = stmt.where(Certificate.self_signed.is_(self_signed))
+    if internal is not None:
+        internal_cond = or_(
+            Certificate.self_signed.is_(True),
+            *[func.lower(Certificate.issuer).like(f"%{p.lower()}%")
+              for p in settings.internal_ca_pattern_list],
+        )
+        stmt = stmt.where(internal_cond if internal else ~internal_cond)
     now = utcnow()
     if expired:
         stmt = stmt.where(Certificate.not_after < now)
@@ -303,8 +311,10 @@ def list_endpoints(
         ))
     if status:
         stmt = stmt.where(Endpoint.last_status == status)
-    if failed:
+    if failed is True:
         stmt = stmt.where(Endpoint.last_status != "ok", Endpoint.last_status != "")
+    elif failed is False:
+        stmt = stmt.where(Endpoint.last_status == "ok")  # hide failed/unscanned
     if port:
         stmt = stmt.where(Endpoint.port == port)
     if environment or owner:

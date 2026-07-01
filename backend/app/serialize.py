@@ -4,8 +4,9 @@ from __future__ import annotations
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from .config import settings
 from .models import Certificate, CertificateObservation, Endpoint, Target
-from .status import days_until, expiry_phrase, severity, status_phrase
+from .status import days_until, expiry_phrase, is_internal, severity, status_phrase
 
 
 def cert_dict(db: Session, cert: Certificate, with_endpoints: bool = False) -> dict:
@@ -26,6 +27,7 @@ def cert_dict(db: Session, cert: Certificate, with_endpoints: bool = False) -> d
         "not_before": cert.not_before,
         "not_after": cert.not_after,
         "self_signed": cert.self_signed,
+        "internal_issued": is_internal(cert.issuer, cert.self_signed, settings.internal_ca_pattern_list),
         "is_wildcard": cert.is_wildcard,
         "is_ca": cert.is_ca,
         "chain_length": cert.chain_length,

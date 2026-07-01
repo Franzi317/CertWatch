@@ -47,7 +47,13 @@ class Target(Base):
     environment: Mapped[str] = mapped_column(String(64), default="prod")
     owner: Mapped[str] = mapped_column(String(255), default="")
     tags: Mapped[list] = mapped_column(JSON, default=list)         # ["pci", "edge"]
+    # schedule_type: interval (use scan_frequency_minutes) | daily | weekly | monthly.
+    # For calendar types, schedule_time is "HH:MM" in the app timezone; schedule_day is
+    # the weekday (0=Mon..6=Sun) for weekly or day-of-month (1..28) for monthly.
     scan_frequency_minutes: Mapped[int] = mapped_column(Integer, default=1440)
+    schedule_type: Mapped[str] = mapped_column(String(16), default="interval")
+    schedule_time: Mapped[str] = mapped_column(String(5), default="00:00")
+    schedule_day: Mapped[int] = mapped_column(Integer, default=0)
     timeout: Mapped[float] = mapped_column(Float, default=5.0)
     concurrency: Mapped[int] = mapped_column(Integer, default=50)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)

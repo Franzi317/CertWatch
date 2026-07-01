@@ -1,18 +1,45 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, Dashboard as Dash, Cert } from "../api";
-import { StatCard, SeverityBadge, fmtDate } from "../ui";
+import { StatCard, SeverityBadge, BarList, fmtDate } from "../ui";
 
 export default function Dashboard() {
   const [d, setD] = useState<Dash | null>(null);
   const [soon, setSoon] = useState<Cert[]>([]);
+  const [expired, setExpired] = useState<Cert[]>([]);
+  const [split, setSplit] = useState<{ internal: number; external: number } | null>(null);
   const [err, setErr] = useState("");
 
   useEffect(() => {
     api.get<Dash>("/dashboard").then(setD).catch((e) => setErr(e.message));
     api.get<{ items: Cert[] }>("/certificates?expiring_within=90&sort=not_after&limit=10")
       .then((r) => setSoon(r.items)).catch(() => {});
+    api.get<{ items: Cert[] }>("/certificates?expired=true&sort=not_after&limit=10")
+      .then((r) => setExpired(r.items)).catch(() => {});
+    Promise.all([
+      api.get<{ total: number }>("/certificates?internal=true&limit=1"),
+      api.get<{ total: number }>("/certificates?internal=false&limit=1"),
+    ]).then(([i, e]) => setSplit({ internal: i.total, external: e.total })).catch(() => {});
   }, []);
+
+  const certTable = (rows: Cert[], empty: string) =>
+    rows.length === 0 ? (
+      <div className="empty">{empty}</div>
+    ) : (
+      <table>
+        <thead><tr><th>Common Name</th><th>Issuer</th><th>Status</th><th>Expires</th></tr></thead>
+        <tbody>
+          {rows.map((c) => (
+            <tr key={c.id}>
+              <td><Link to={`/certificates/${c.id}`}>{c.common_name || c.fingerprint_sha256.slice(0, 24)}</Link></td>
+              <td>{c.issuer_cn || "—"}</td>
+              <td><SeverityBadge severity={c.severity} label={c.expiry_phrase} /></td>
+              <td>{fmtDate(c.not_after)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    );
 
   return (
     <>
@@ -34,6 +61,30 @@ export default function Dashboard() {
             </div>
 
             <div className="panel" style={{ marginTop: 20 }}>
+              <div className="chart-grid">
+                <div>
+                  <h2>Expiration breakdown</h2>
+                  <BarList segments={[
+                    { label: "Expired", value: d.expired, color: "#7f1d1d" },
+                    { label: "≤ 7 days", value: d.expiring_7d, color: "var(--critical)" },
+                    { label: "8–30 days", value: Math.max(0, d.expiring_30d - d.expiring_7d), color: "var(--warning)" },
+                    { label: "31–90 days", value: Math.max(0, d.expiring_90d - d.expiring_30d), color: "var(--info)" },
+                    { label: "> 90 days", value: Math.max(0, d.total_certificates - d.expired - d.expiring_90d), color: "var(--healthy)" },
+                  ]} />
+                </div>
+                <div>
+                  <h2>Internal vs external</h2>
+                  {split ? (
+                    <BarList segments={[
+                      { label: "Internal", value: split.internal, color: "#8b5cf6" },
+                      { label: "External", value: split.external, color: "var(--info)" },
+                    ]} />
+                  ) : <div className="muted">Loading…</div>}
+                </div>
+              </div>
+            </div>
+
+            <div className="panel">
               <div className="kv">
                 <dt>Last successful scan</dt><dd>{fmtDate(d.last_successful_scan)}</dd>
                 <dt>Next scheduled scan</dt><dd>{fmtDate(d.next_scheduled_scan)}</dd>
@@ -41,24 +92,13 @@ export default function Dashboard() {
             </div>
 
             <div className="panel">
-              <h2>Expiration timeline — soonest 10</h2>
-              {soon.length === 0 ? (
-                <div className="empty">No certificates expiring within 90 days.</div>
-              ) : (
-                <table>
-                  <thead><tr><th>Common Name</th><th>Issuer</th><th>Status</th><th>Expires</th></tr></thead>
-                  <tbody>
-                    {soon.map((c) => (
-                      <tr key={c.id}>
-                        <td><Link to={`/certificates/${c.id}`}>{c.common_name || c.fingerprint_sha256.slice(0, 24)}</Link></td>
-                        <td>{c.issuer_cn || "—"}</td>
-                        <td><SeverityBadge severity={c.severity} label={c.expiry_phrase} /></td>
-                        <td>{fmtDate(c.not_after)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
+              <h2>Upcoming Expirations</h2>
+              {certTable(soon, "No certificates expiring within 90 days.")}
+            </div>
+
+            <div className="panel">
+              <h2>Expired</h2>
+              {certTable(expired, "No expired certificates.")}
             </div>
           </>
         )}
