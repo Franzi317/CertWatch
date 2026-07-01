@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import select
 
+from .config import settings
 from .db import SessionLocal
 from .models import ScanJob, Target, utcnow
 from .scan_engine import run_scan_job
@@ -35,16 +36,60 @@ def enqueue_scan(db, target: Target, trigger: str = "manual") -> ScanJob:
     return job
 
 
+def _parse_hhmm(s: str) -> tuple[int, int]:
+    try:
+        hh, mm = (s or "00:00").split(":")
+        return max(0, min(23, int(hh))), max(0, min(59, int(mm)))
+    except (ValueError, AttributeError):
+        return 0, 0
+
+
+def _last_occurrence(schedule_type: str, hh: int, mm: int, day: int, now_local: datetime):
+    """Most recent local datetime this calendar schedule should have fired, <= now."""
+    at = lambda d: d.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if schedule_type == "daily":
+        base = at(now_local)
+        return base if base <= now_local else base - timedelta(days=1)
+    if schedule_type == "weekly":
+        for delta in range(0, 8):  # scan back up to a week for the matching weekday
+            d = now_local - timedelta(days=delta)
+            fire = at(d)
+            if d.weekday() == day and fire <= now_local:
+                return fire
+        return None
+    if schedule_type == "monthly":
+        dom = min(max(day, 1), 28)  # cap at 28 so every month has the day
+        fire = at(now_local.replace(day=dom))
+        if fire <= now_local:
+            return fire
+        prev_month_last = now_local.replace(day=1) - timedelta(days=1)
+        return at(prev_month_last.replace(day=dom))
+    return None
+
+
+def schedule_due(t: Target, now_utc: datetime) -> bool:
+    """True if target t should scan now. Interval uses minutes; calendar types fire
+    once per window (with catch-up if the app was down when the window opened)."""
+    last = _aware(t.last_scanned_at) if t.last_scanned_at else None
+    st = getattr(t, "schedule_type", "interval") or "interval"
+    if st == "interval":
+        return last is None or now_utc - last >= timedelta(minutes=t.scan_frequency_minutes)
+    hh, mm = _parse_hhmm(getattr(t, "schedule_time", "00:00"))
+    now_local = now_utc.astimezone(settings.tzinfo)
+    occ = _last_occurrence(st, hh, mm, getattr(t, "schedule_day", 0) or 0, now_local)
+    if occ is None:
+        return False
+    occ_utc = occ.astimezone(timezone.utc)
+    return last is None or last < occ_utc
+
+
 def _tick() -> None:
     db = SessionLocal()
     try:
         now = utcnow()
         targets = db.scalars(select(Target).where(Target.enabled.is_(True))).all()
         for t in targets:
-            due = t.last_scanned_at is None or (
-                now - _aware(t.last_scanned_at) >= timedelta(minutes=t.scan_frequency_minutes)
-            )
-            if not due:
+            if not schedule_due(t, now):
                 continue
             # skip if a job for this target is already active
             active = db.scalar(select(ScanJob).where(

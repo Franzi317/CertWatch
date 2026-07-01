@@ -17,6 +17,9 @@ class TargetIn(BaseModel):
     owner: str = ""
     tags: list[str] = Field(default_factory=list)
     scan_frequency_minutes: int = 1440
+    schedule_type: str = "interval"      # interval | daily | weekly | monthly
+    schedule_time: str = "00:00"         # "HH:MM" in the app timezone (calendar types)
+    schedule_day: int = 0                # weekly: 0=Mon..6=Sun; monthly: 1..28
     timeout: float = 5.0
     concurrency: int = 50
     enabled: bool = True

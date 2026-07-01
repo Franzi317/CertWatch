@@ -47,6 +47,14 @@ def expiry_phrase(days: int | None) -> str:
     return f"Expiring in {days} day{'s' if days != 1 else ''}"
 
 
+def is_internal(issuer: str, self_signed: bool, patterns: list[str]) -> bool:
+    """Internally-issued = self-signed, or issuer DN matches a configured pattern."""
+    if self_signed:
+        return True
+    iss = (issuer or "").lower()
+    return any(p.lower() in iss for p in patterns)
+
+
 def status_phrase(scan_status: str) -> str:
     """Human copy for a scan status code."""
     return {

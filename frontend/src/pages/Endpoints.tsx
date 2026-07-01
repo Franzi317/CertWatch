@@ -4,14 +4,15 @@ import { api, Endpoint } from "../api";
 import { DataTable, SeverityBadge, fmtDate } from "../ui";
 
 export default function Endpoints() {
-  const [failedOnly, setFailedOnly] = useState(false);
+  const [view, setView] = useState<"all" | "ok" | "failed">("ok");
   const [rows, setRows] = useState<Endpoint[]>([]);
   const [total, setTotal] = useState(0);
 
   useEffect(() => {
-    api.get<{ total: number; items: Endpoint[] }>(`/endpoints?limit=2000${failedOnly ? "&failed=true" : ""}`)
+    const qs = { all: "", ok: "&failed=false", failed: "&failed=true" }[view];
+    api.get<{ total: number; items: Endpoint[] }>(`/endpoints?limit=2000${qs}`)
       .then((r) => { setRows(r.items); setTotal(r.total); }).catch(() => {});
-  }, [failedOnly]);
+  }, [view]);
 
   return (
     <>
@@ -19,8 +20,9 @@ export default function Endpoints() {
       <div className="content">
         <div className="panel">
           <div className="row" style={{ marginBottom: 14 }}>
-            <button className={!failedOnly ? "" : "secondary"} onClick={() => setFailedOnly(false)}>All endpoints</button>
-            <button className={failedOnly ? "" : "secondary"} onClick={() => setFailedOnly(true)}>Failed scans</button>
+            <button className={view === "all" ? "" : "secondary"} onClick={() => setView("all")}>All endpoints</button>
+            <button className={view === "ok" ? "" : "secondary"} onClick={() => setView("ok")}>With certificate</button>
+            <button className={view === "failed" ? "" : "secondary"} onClick={() => setView("failed")}>Failed scans</button>
             <div className="spacer" />
             <span className="muted">{total} endpoints</span>
           </div>

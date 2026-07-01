@@ -13,6 +13,28 @@ export function StatCard({ label, value, severity }: { label: string; value: Rea
   );
 }
 
+export interface Seg { label: string; value: number; color: string; }
+
+// One horizontal bar per category. Bar widths are scaled to the largest value so
+// small categories stay visible; the exact count sits at the right.
+export function BarList({ segments }: { segments: Seg[] }) {
+  const max = Math.max(1, ...segments.map((s) => s.value));
+  return (
+    <div className="barlist">
+      {segments.map((s) => (
+        <div key={s.label} className="barlist-row">
+          <span className="barlist-label">{s.label}</span>
+          <div className="barlist-track">
+            <div className="barlist-fill" title={`${s.label}: ${s.value}`}
+              style={{ width: `${(s.value / max) * 100}%`, minWidth: s.value > 0 ? 3 : 0, background: s.color }} />
+          </div>
+          <span className="barlist-value">{s.value}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
   return (
     <div className="modal-backdrop" onClick={onClose}>

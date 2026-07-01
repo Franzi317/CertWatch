@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { NavLink, Route, Routes } from "react-router-dom";
 import Dashboard from "./pages/Dashboard";
 import Targets from "./pages/Targets";
@@ -20,6 +21,16 @@ const nav = [
 ];
 
 export default function App() {
+  const [theme, setTheme] = useState(
+    () => localStorage.getItem("theme")
+      || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"),
+  );
+  const [showHelp, setShowHelp] = useState(false);
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem("theme", theme);
+  }, [theme]);
+
   return (
     <div className="layout">
       <aside className="sidebar">
@@ -31,9 +42,16 @@ export default function App() {
             </NavLink>
           ))}
         </nav>
-        <div className="notice">
-          Authorized internal inventory only. Scan only networks and hosts you are
-          authorized to assess.
+        <div className="sidebar-foot">
+          <button className="theme-toggle" onClick={() => setShowHelp((v) => !v)}>Help</button>
+          {showHelp && <div className="notice">Need assistance? Contact Ryan Franzman.</div>}
+          <button className="theme-toggle" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
+            {theme === "dark" ? "☀ Light mode" : "🌙 Dark mode"}
+          </button>
+          <div className="notice">
+            Authorized internal inventory only. Scan only networks and hosts you are
+            authorized to assess.
+          </div>
         </div>
       </aside>
       <main className="main">

@@ -6,6 +6,7 @@ const COMMON_PORTS = [443, 8443, 9443, 636, 993, 995, 465, 587, 3389, 5986];
 const BLANK: Partial<Target> = {
   name: "", description: "", target_type: "hostname", value: "", ports: [443],
   environment: "prod", owner: "", tags: [], scan_frequency_minutes: 1440, timeout: 5,
+  schedule_type: "interval", schedule_time: "00:00", schedule_day: 0,
   concurrency: 50, enabled: true, alert_thresholds: [90, 60, 30, 14, 7, 1], use_sni: true,
 };
 
@@ -127,8 +128,34 @@ export default function Targets() {
               <input value={editing.owner || ""} onChange={(e) => set({ owner: e.target.value })} style={{ width: "100%" }} /></div>
             <div className="field"><label>Tags (comma-separated)</label>
               <input value={(editing.tags || []).join(",")} onChange={(e) => set({ tags: e.target.value.split(",").map((x) => x.trim()).filter(Boolean) })} style={{ width: "100%" }} /></div>
-            <div className="field"><label>Scan frequency (minutes)</label>
-              <input type="number" value={editing.scan_frequency_minutes} onChange={(e) => set({ scan_frequency_minutes: +e.target.value })} style={{ width: "100%" }} /></div>
+            <div className="field" style={{ gridColumn: "1 / 3" }}><label>Schedule</label>
+              <div className="row">
+                <select value={editing.schedule_type || "interval"} onChange={(e) => set({ schedule_type: e.target.value })}>
+                  <option value="interval">Every N minutes</option>
+                  <option value="daily">Daily</option>
+                  <option value="weekly">Weekly</option>
+                  <option value="monthly">Monthly</option>
+                </select>
+                {(editing.schedule_type || "interval") === "interval" && (
+                  <input type="number" min={1} title="minutes" value={editing.scan_frequency_minutes}
+                    onChange={(e) => set({ scan_frequency_minutes: +e.target.value })} style={{ width: 120 }} />
+                )}
+                {editing.schedule_type === "weekly" && (
+                  <select value={editing.schedule_day ?? 0} onChange={(e) => set({ schedule_day: +e.target.value })}>
+                    {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((d, i) => <option key={d} value={i}>{d}</option>)}
+                  </select>
+                )}
+                {editing.schedule_type === "monthly" && (
+                  <input type="number" min={1} max={28} title="day of month (1–28)" value={editing.schedule_day || 1}
+                    onChange={(e) => set({ schedule_day: +e.target.value })} style={{ width: 90 }} />
+                )}
+                {editing.schedule_type && editing.schedule_type !== "interval" && (
+                  <input type="time" value={editing.schedule_time || "00:00"} onChange={(e) => set({ schedule_time: e.target.value })} />
+                )}
+              </div>
+              {editing.schedule_type && editing.schedule_type !== "interval" &&
+                <span className="muted" style={{ fontSize: 11 }}>Start time is in the configured app timezone (CERTWATCH_TIMEZONE).</span>}
+            </div>
             <div className="field"><label>Timeout (s)</label>
               <input type="number" step="0.5" value={editing.timeout} onChange={(e) => set({ timeout: +e.target.value })} style={{ width: "100%" }} /></div>
             <div className="field"><label>Concurrency</label>

@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     # CORS origins for the React dev server. Comma-separated.
     cors_origins: str = "http://localhost:5173,http://localhost:3000"
 
+    # Comma-separated substrings matched (case-insensitive) against a cert's issuer
+    # DN to classify it as internally-issued. Self-signed certs are always internal.
+    internal_ca_patterns: str = ""
+
     # Scan safety guardrails.
     max_cidr_hosts: int = 4096          # refuse to expand a target larger than this
     default_timeout: float = 5.0        # seconds per TLS connection
@@ -31,12 +35,28 @@ class Settings(BaseSettings):
     # Run the in-process scheduler (set false when running pure API/worker splits).
     enable_scheduler: bool = True
 
+    # IANA timezone that calendar schedules (daily/weekly/monthly start times) are
+    # interpreted in. Falls back to UTC if unset or invalid. DST-aware via zoneinfo.
+    timezone: str = "UTC"
+
     # Path to built frontend (served as static in production). Empty = API only.
     static_dir: str = ""
 
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def internal_ca_pattern_list(self) -> list[str]:
+        return [p.strip() for p in self.internal_ca_patterns.split(",") if p.strip()]
+
+    @property
+    def tzinfo(self):
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            return ZoneInfo(self.timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            return ZoneInfo("UTC")
 
 
 settings = Settings()
