@@ -727,12 +727,25 @@ def dashboard(db: Session = Depends(get_db)):
 # --------------------------------------------------------------------------- #
 # Static frontend (production) — must be mounted last so /api wins.
 # --------------------------------------------------------------------------- #
+def _safe_static_path(static_dir: str, full_path: str) -> str | None:
+    """Return an absolute path INSIDE static_dir for full_path, or None if it
+    escapes (traversal) or isn't a real file."""
+    if not full_path:
+        return None
+    root = os.path.realpath(static_dir)
+    candidate = os.path.realpath(os.path.join(root, full_path))
+    # candidate must be root itself or strictly within root
+    if candidate != root and not candidate.startswith(root + os.sep):
+        return None
+    return candidate if os.path.isfile(candidate) else None
+
+
 if settings.static_dir and os.path.isdir(settings.static_dir):
     static_dir = settings.static_dir
 
     @app.get("/{full_path:path}")
     def spa(full_path: str):
-        candidate = os.path.join(static_dir, full_path)
-        if full_path and os.path.isfile(candidate):
-            return FileResponse(candidate)
+        safe = _safe_static_path(static_dir, full_path)
+        if safe:
+            return FileResponse(safe)
         return FileResponse(os.path.join(static_dir, "index.html"))
