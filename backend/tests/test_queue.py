@@ -28,18 +28,8 @@ def test_enqueue_then_claim_marks_leased(db):
     assert _aware(item.lease_expires_at) > datetime.now(timezone.utc)
 
 
-def test_claim_on_empty_queue_returns_none():
-    from app.db import SessionLocal
-    from app.models import Base
-    from app.db import engine
-
-    Base.metadata.drop_all(engine)
-    Base.metadata.create_all(engine)
-    session = SessionLocal()
-    try:
-        assert queue.claim(session) is None
-    finally:
-        session.close()
+def test_claim_on_empty_queue_returns_none(db):
+    assert queue.claim(db) is None
 
 
 def test_second_claim_on_otherwise_empty_queue_returns_none(db):
@@ -89,6 +79,29 @@ def test_fail_at_max_attempts_marks_failed(db):
     assert claimed.last_error == "boom"
 
     # Not claimable anymore.
+    assert queue.claim(db) is None
+
+
+def test_fail_exhausts_default_max_attempts_then_failed(db):
+    item = queue.enqueue(db, "scan", {"target_id": 1})
+
+    for expected_attempt in (1, 2, 3):
+        claimed = queue.claim(db)
+        assert claimed is not None
+        assert claimed.id == item.id
+        assert claimed.attempts == expected_attempt
+
+        queue.fail(db, claimed, "boom")
+        db.refresh(claimed)
+
+        if expected_attempt < 3:
+            assert claimed.status == "queued"
+            assert claimed.lease_expires_at is None
+        else:
+            assert claimed.status == "failed"
+            assert claimed.attempts == 3
+
+    # Exhausted: no 4th execution.
     assert queue.claim(db) is None
 
 
