@@ -10,7 +10,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import timedelta
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sqlalchemy import String, cast, func, or_, select
@@ -19,7 +19,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from . import schemas, targets as target_lib
 from .alerts import dispatch_alerts, evaluate_alerts
-from .auth import router as auth_router
+from .auth import require_role, router as auth_router
 from .config import settings
 from .secrets import SecretsNotConfigured, encrypt as encrypt_secret, is_encrypted
 from .db import get_db, init_db
@@ -90,15 +90,6 @@ def _seed_settings() -> None:
         db.close()
 
 
-def require_auth(authorization: str = Header(default="")) -> None:
-    """Optional bearer-token guard. Open when CERTWATCH_API_KEY is unset."""
-    if not settings.api_key:
-        return
-    token = authorization.removeprefix("Bearer ").strip()
-    if token != settings.api_key:
-        raise HTTPException(status_code=401, detail="invalid or missing API key")
-
-
 def audit(db: Session, action: str, entity: str, entity_id, detail: str = "") -> None:
     db.add(AuditLog(action=action, entity=entity, entity_id=str(entity_id), detail=detail))
 
@@ -121,12 +112,12 @@ def _target_out(db: Session, t: Target) -> dict:
     return out
 
 
-@app.get("/api/targets", dependencies=[Depends(require_auth)])
+@app.get("/api/targets", dependencies=[Depends(require_role("viewer"))])
 def list_targets(db: Session = Depends(get_db)):
     return [_target_out(db, t) for t in db.scalars(select(Target).order_by(Target.name)).all()]
 
 
-@app.post("/api/targets/validate", dependencies=[Depends(require_auth)])
+@app.post("/api/targets/validate", dependencies=[Depends(require_role("viewer"))])
 def validate_target(body: schemas.TargetIn):
     try:
         count = target_lib.validate(body.target_type, body.value, settings.max_cidr_hosts)
@@ -142,7 +133,7 @@ def validate_target(body: schemas.TargetIn):
     }
 
 
-@app.post("/api/targets", dependencies=[Depends(require_auth)], status_code=201)
+@app.post("/api/targets", dependencies=[Depends(require_role("operator"))], status_code=201)
 def create_target(body: schemas.TargetIn, db: Session = Depends(get_db)):
     try:
         target_lib.validate(body.target_type, body.value, settings.max_cidr_hosts)
@@ -159,7 +150,7 @@ def create_target(body: schemas.TargetIn, db: Session = Depends(get_db)):
     return _target_out(db, t)
 
 
-@app.get("/api/targets/{target_id}", dependencies=[Depends(require_auth)])
+@app.get("/api/targets/{target_id}", dependencies=[Depends(require_role("viewer"))])
 def get_target(target_id: int, db: Session = Depends(get_db)):
     t = db.get(Target, target_id)
     if not t:
@@ -167,7 +158,7 @@ def get_target(target_id: int, db: Session = Depends(get_db)):
     return _target_out(db, t)
 
 
-@app.put("/api/targets/{target_id}", dependencies=[Depends(require_auth)])
+@app.put("/api/targets/{target_id}", dependencies=[Depends(require_role("operator"))])
 def update_target(target_id: int, body: schemas.TargetIn, db: Session = Depends(get_db)):
     t = db.get(Target, target_id)
     if not t:
@@ -185,7 +176,7 @@ def update_target(target_id: int, body: schemas.TargetIn, db: Session = Depends(
     return _target_out(db, t)
 
 
-@app.delete("/api/targets/{target_id}", dependencies=[Depends(require_auth)], status_code=204)
+@app.delete("/api/targets/{target_id}", dependencies=[Depends(require_role("operator"))], status_code=204)
 def delete_target(target_id: int, db: Session = Depends(get_db)):
     t = db.get(Target, target_id)
     if not t:
@@ -198,7 +189,7 @@ def delete_target(target_id: int, db: Session = Depends(get_db)):
 # --------------------------------------------------------------------------- #
 # Scan jobs
 # --------------------------------------------------------------------------- #
-@app.post("/api/targets/{target_id}/scan", dependencies=[Depends(require_auth)], status_code=202)
+@app.post("/api/targets/{target_id}/scan", dependencies=[Depends(require_role("operator"))], status_code=202)
 def start_scan(target_id: int, db: Session = Depends(get_db)):
     t = db.get(Target, target_id)
     if not t:
@@ -207,7 +198,7 @@ def start_scan(target_id: int, db: Session = Depends(get_db)):
     return schemas.ScanJobOut.model_validate(job).model_dump()
 
 
-@app.post("/api/scans/{job_id}/cancel", dependencies=[Depends(require_auth)])
+@app.post("/api/scans/{job_id}/cancel", dependencies=[Depends(require_role("operator"))])
 def cancel_scan(job_id: int, db: Session = Depends(get_db)):
     job = db.get(ScanJob, job_id)
     if not job:
@@ -218,13 +209,13 @@ def cancel_scan(job_id: int, db: Session = Depends(get_db)):
     return schemas.ScanJobOut.model_validate(job).model_dump()
 
 
-@app.get("/api/scans", dependencies=[Depends(require_auth)])
+@app.get("/api/scans", dependencies=[Depends(require_role("viewer"))])
 def list_scans(limit: int = Query(50, le=500), db: Session = Depends(get_db)):
     jobs = db.scalars(select(ScanJob).order_by(ScanJob.id.desc()).limit(limit)).all()
     return [schemas.ScanJobOut.model_validate(j).model_dump() for j in jobs]
 
 
-@app.get("/api/scans/{job_id}", dependencies=[Depends(require_auth)])
+@app.get("/api/scans/{job_id}", dependencies=[Depends(require_role("viewer"))])
 def get_scan(job_id: int, db: Session = Depends(get_db)):
     job = db.get(ScanJob, job_id)
     if not job:
@@ -235,7 +226,7 @@ def get_scan(job_id: int, db: Session = Depends(get_db)):
 # --------------------------------------------------------------------------- #
 # Certificates (deduplicated by fingerprint)
 # --------------------------------------------------------------------------- #
-@app.get("/api/certificates", dependencies=[Depends(require_auth)])
+@app.get("/api/certificates", dependencies=[Depends(require_role("viewer"))])
 def list_certificates(
     q: str = "",
     expiring_within: int | None = None,
@@ -281,7 +272,7 @@ def list_certificates(
     return {"total": total, "items": [cert_dict(db, c) for c in rows]}
 
 
-@app.get("/api/certificates/{cert_id}", dependencies=[Depends(require_auth)])
+@app.get("/api/certificates/{cert_id}", dependencies=[Depends(require_role("viewer"))])
 def get_certificate(cert_id: int, db: Session = Depends(get_db)):
     c = db.get(Certificate, cert_id)
     if not c:
@@ -300,7 +291,7 @@ def get_certificate(cert_id: int, db: Session = Depends(get_db)):
 # --------------------------------------------------------------------------- #
 # Endpoints
 # --------------------------------------------------------------------------- #
-@app.get("/api/endpoints", dependencies=[Depends(require_auth)])
+@app.get("/api/endpoints", dependencies=[Depends(require_role("viewer"))])
 def list_endpoints(
     q: str = "",
     status: str = "",
@@ -338,7 +329,7 @@ def list_endpoints(
     return {"total": total, "items": [endpoint_dict(db, e, with_cert=False) for e in rows]}
 
 
-@app.get("/api/endpoints/{endpoint_id}", dependencies=[Depends(require_auth)])
+@app.get("/api/endpoints/{endpoint_id}", dependencies=[Depends(require_role("viewer"))])
 def get_endpoint(endpoint_id: int, db: Session = Depends(get_db)):
     ep = db.get(Endpoint, endpoint_id)
     if not ep:
@@ -379,7 +370,7 @@ def _alert_dict(db: Session, ev: AlertEvent) -> dict:
     }
 
 
-@app.get("/api/alerts", dependencies=[Depends(require_auth)])
+@app.get("/api/alerts", dependencies=[Depends(require_role("viewer"))])
 def list_alerts(include_resolved: bool = False, db: Session = Depends(get_db)):
     stmt = select(AlertEvent).order_by(AlertEvent.updated_at.desc())
     if not include_resolved:
@@ -387,7 +378,7 @@ def list_alerts(include_resolved: bool = False, db: Session = Depends(get_db)):
     return [_alert_dict(db, e) for e in db.scalars(stmt).all()]
 
 
-@app.post("/api/alerts/{alert_id}/ack", dependencies=[Depends(require_auth)])
+@app.post("/api/alerts/{alert_id}/ack", dependencies=[Depends(require_role("operator"))])
 def ack_alert(alert_id: int, db: Session = Depends(get_db)):
     ev = db.get(AlertEvent, alert_id)
     if not ev:
@@ -397,7 +388,7 @@ def ack_alert(alert_id: int, db: Session = Depends(get_db)):
     return _alert_dict(db, ev)
 
 
-@app.post("/api/alerts/{alert_id}/mute", dependencies=[Depends(require_auth)])
+@app.post("/api/alerts/{alert_id}/mute", dependencies=[Depends(require_role("operator"))])
 def mute_alert(alert_id: int, body: schemas.AlertActionIn, db: Session = Depends(get_db)):
     ev = db.get(AlertEvent, alert_id)
     if not ev:
@@ -408,7 +399,7 @@ def mute_alert(alert_id: int, body: schemas.AlertActionIn, db: Session = Depends
     return _alert_dict(db, ev)
 
 
-@app.post("/api/alerts/{alert_id}/unmute", dependencies=[Depends(require_auth)])
+@app.post("/api/alerts/{alert_id}/unmute", dependencies=[Depends(require_role("operator"))])
 def unmute_alert(alert_id: int, db: Session = Depends(get_db)):
     ev = db.get(AlertEvent, alert_id)
     if not ev:
@@ -419,7 +410,7 @@ def unmute_alert(alert_id: int, db: Session = Depends(get_db)):
     return _alert_dict(db, ev)
 
 
-@app.post("/api/alerts/evaluate", dependencies=[Depends(require_auth)])
+@app.post("/api/alerts/evaluate", dependencies=[Depends(require_role("operator"))])
 def evaluate(db: Session = Depends(get_db)):
     return evaluate_alerts(db)
 
@@ -456,12 +447,12 @@ def _channel_out(ch: NotificationChannel) -> dict:
     }
 
 
-@app.get("/api/channels", dependencies=[Depends(require_auth)])
+@app.get("/api/channels", dependencies=[Depends(require_role("viewer"))])
 def list_channels(db: Session = Depends(get_db)):
     return [_channel_out(c) for c in db.scalars(select(NotificationChannel)).all()]
 
 
-@app.post("/api/channels", dependencies=[Depends(require_auth)], status_code=201)
+@app.post("/api/channels", dependencies=[Depends(require_role("operator"))], status_code=201)
 def create_channel(body: schemas.ChannelIn, db: Session = Depends(get_db)):
     data = body.model_dump()
     try:
@@ -476,7 +467,7 @@ def create_channel(body: schemas.ChannelIn, db: Session = Depends(get_db)):
     return _channel_out(ch)
 
 
-@app.put("/api/channels/{channel_id}", dependencies=[Depends(require_auth)])
+@app.put("/api/channels/{channel_id}", dependencies=[Depends(require_role("operator"))])
 def update_channel(channel_id: int, body: schemas.ChannelIn, db: Session = Depends(get_db)):
     ch = db.get(NotificationChannel, channel_id)
     if not ch:
@@ -499,7 +490,7 @@ def update_channel(channel_id: int, body: schemas.ChannelIn, db: Session = Depen
     return _channel_out(ch)
 
 
-@app.delete("/api/channels/{channel_id}", dependencies=[Depends(require_auth)], status_code=204)
+@app.delete("/api/channels/{channel_id}", dependencies=[Depends(require_role("operator"))], status_code=204)
 def delete_channel(channel_id: int, db: Session = Depends(get_db)):
     ch = db.get(NotificationChannel, channel_id)
     if not ch:
@@ -509,7 +500,7 @@ def delete_channel(channel_id: int, db: Session = Depends(get_db)):
     db.commit()
 
 
-@app.post("/api/channels/{channel_id}/test", dependencies=[Depends(require_auth)])
+@app.post("/api/channels/{channel_id}/test", dependencies=[Depends(require_role("operator"))])
 def test_channel(channel_id: int, db: Session = Depends(get_db)):
     ch = db.get(NotificationChannel, channel_id)
     if not ch:
@@ -535,13 +526,13 @@ def _base_url(db: Session) -> str:
     return row.value.get("value") if row else "http://localhost:5173"
 
 
-@app.get("/api/settings", dependencies=[Depends(require_auth)])
+@app.get("/api/settings", dependencies=[Depends(require_role("viewer"))])
 def get_settings(db: Session = Depends(get_db)):
     rows = db.scalars(select(SystemSetting)).all()
     return {r.key: r.value.get("value") for r in rows}
 
 
-@app.put("/api/settings", dependencies=[Depends(require_auth)])
+@app.put("/api/settings", dependencies=[Depends(require_role("operator"))])
 def update_settings(body: dict, db: Session = Depends(get_db)):
     for key, value in body.items():
         row = db.get(SystemSetting, key)
@@ -557,7 +548,7 @@ def update_settings(body: dict, db: Session = Depends(get_db)):
 # --------------------------------------------------------------------------- #
 # Dashboard
 # --------------------------------------------------------------------------- #
-@app.get("/api/dashboard", dependencies=[Depends(require_auth)])
+@app.get("/api/dashboard", dependencies=[Depends(require_role("viewer"))])
 def dashboard(db: Session = Depends(get_db)):
     now = utcnow()
     total_certs = db.scalar(select(func.count(Certificate.id))) or 0

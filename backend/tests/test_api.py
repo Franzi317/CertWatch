@@ -4,8 +4,21 @@ import pytest
 
 from app import scan_engine
 from app.scanner import ScanResult
+from conftest import login_as
 
 TARGET = {"name": "Lab box", "target_type": "ip", "value": "10.0.0.5", "ports": [443, 8443]}
+
+
+# These tests predate RBAC (Phase 0, Task 5) and exercise every route as an
+# open API. Rather than rewrite each test to establish its own session, this
+# overrides the module-scoped `client` fixture (same name, referencing the
+# parent fixture from conftest.py) to log in as admin — admin outranks every
+# role, so all previously-open calls stay authorized without touching the
+# test bodies below.
+@pytest.fixture
+def client(client, monkeypatch):
+    login_as(client, "admin", monkeypatch)
+    return client
 
 
 def _fake_cert(fp="AB:CD"):

@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .db import get_db
-from .models import User, utcnow
+from .models import ROLE_RANK, User, utcnow
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -106,6 +106,43 @@ def _require_user(request: Request) -> dict:
     if user is None:
         raise HTTPException(status_code=401, detail="not authenticated")
     return user
+
+
+# --------------------------------------------------------------------------- #
+# RBAC dependency (Phase 0, Task 5)
+# --------------------------------------------------------------------------- #
+def require_role(min_role: str):
+    """FastAPI dependency factory enforcing a minimum role on a route.
+
+    Resolution order:
+      1. A valid session (`current_user(request)` is not None) -> use the
+         session user's role.
+      2. Else an `Authorization: Bearer <token>` matching `settings.api_key`
+         (only when `api_key` is non-empty) -> role "operator" (the shared
+         service-account credential from Task 3/earlier phases). This path
+         can NEVER grant "admin".
+      3. Else -> 401.
+
+    Once a role is resolved, `ROLE_RANK[role] < ROLE_RANK[min_role]` -> 403.
+    Returns the resolved principal dict so handlers/audit logging can use it.
+    """
+    def _dependency(request: Request) -> dict:
+        user = current_user(request)
+        if user is not None:
+            principal = {"email": user.get("email"), "role": user.get("role", "viewer")}
+        else:
+            authorization = request.headers.get("authorization", "")
+            token = authorization.removeprefix("Bearer ").strip()
+            if settings.api_key and token == settings.api_key:
+                principal = {"email": "service-account", "role": "operator"}
+            else:
+                raise HTTPException(status_code=401, detail="not authenticated")
+
+        if ROLE_RANK.get(principal["role"], -1) < ROLE_RANK[min_role]:
+            raise HTTPException(status_code=403, detail="insufficient role")
+        return principal
+
+    return _dependency
 
 
 def _upsert_user(db: Session, email: str) -> User:

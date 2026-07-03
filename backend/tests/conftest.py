@@ -60,3 +60,35 @@ def client():
     # the signed session cookie) is shared across calls within one test.
     with TestClient(app, follow_redirects=False) as c:  # lifespan creates tables + seeds settings
         yield c
+
+
+_ROLE_ENV_VARS = {
+    "admin": "CERTWATCH_ENTRA_ADMIN_GROUP",
+    "operator": "CERTWATCH_ENTRA_OPERATOR_GROUP",
+    "viewer": "CERTWATCH_ENTRA_VIEWER_GROUP",
+}
+
+
+def login_as(client, role: str, monkeypatch, email: str | None = None) -> dict:
+    """Establish a session on `client` with the given role via the real OIDC
+    callback seam (Task 4): map a synthetic Entra group to `role`, monkeypatch
+    `auth._fetch_token` to return that group, then hit `/api/auth/callback`.
+
+    Used both by test_rbac.py (to get viewer/operator/admin sessions) and by
+    test_api.py (via its `client` fixture override) so the pre-existing API
+    tests run against a real authenticated session instead of the old open
+    bearer-token guard.
+    """
+    from app import auth
+
+    email = email or f"{role}@test.local"
+    group = f"g-{role}-rbac-test"
+    monkeypatch.setenv(_ROLE_ENV_VARS[role], group)
+    auth._reset_cache()
+    monkeypatch.setattr(auth, "_fetch_token", lambda req: {
+        "email": email, "name": role.title(), "oid": role, "groups": [group],
+    })
+    r = client.get("/api/auth/callback?code=abc&state=xyz")
+    assert r.status_code == 200, r.text
+    assert r.json()["role"] == role
+    return r.json()
