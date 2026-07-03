@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
@@ -25,6 +25,7 @@ from .config import settings
 from .secrets import SecretsNotConfigured, encrypt as encrypt_secret, is_encrypted
 from .db import engine, get_db, init_db, run_migrations
 from .models import (
+    AcmeChallenge,
     AlertEvent,
     AuditLog,
     Certificate,
@@ -722,6 +723,18 @@ def dashboard(db: Session = Depends(get_db)):
         "last_successful_scan": last_ok,
         "next_scheduled_scan": next_scan,
     }
+
+
+# --------------------------------------------------------------------------- #
+# ACME HTTP-01 challenge responder — PUBLIC (no auth), and must be registered
+# before the SPA catch-all below or it would be swallowed by it.
+# --------------------------------------------------------------------------- #
+@app.get("/.well-known/acme-challenge/{token}")
+def acme_challenge(token: str, db: Session = Depends(get_db)):
+    challenge = db.get(AcmeChallenge, token)
+    if challenge is None:
+        raise HTTPException(status_code=404, detail="unknown challenge token")
+    return PlainTextResponse(challenge.key_authorization)
 
 
 # --------------------------------------------------------------------------- #

@@ -258,6 +258,19 @@ class Issuer(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class AcmeChallenge(Base):
+    """Pending ACME HTTP-01 challenges. The public `/.well-known/acme-challenge/{token}`
+    route (main.py) serves `key_authorization` for a row here; the ACME adapter
+    inserts a row before answering each challenge and deletes it (best-effort)
+    once the order finalizes."""
+
+    __tablename__ = "acme_challenges"
+
+    token: Mapped[str] = mapped_column(String(255), primary_key=True)
+    key_authorization: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     __table_args__ = (Index("ix_audit_logs_created_at", "created_at"),)
