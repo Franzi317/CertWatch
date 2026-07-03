@@ -18,6 +18,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -218,8 +219,10 @@ class User(Base):
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
+    __table_args__ = (Index("ix_audit_logs_created_at", "created_at"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    actor: Mapped[str] = mapped_column(String(255), default="")  # acting user's email, "service-account", or "system"
     action: Mapped[str] = mapped_column(String(64))     # target.create, channel.update, ...
     entity: Mapped[str] = mapped_column(String(64))
     entity_id: Mapped[str] = mapped_column(String(64), default="")

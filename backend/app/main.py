@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -90,8 +90,8 @@ def _seed_settings() -> None:
         db.close()
 
 
-def audit(db: Session, action: str, entity: str, entity_id, detail: str = "") -> None:
-    db.add(AuditLog(action=action, entity=entity, entity_id=str(entity_id), detail=detail))
+def audit(db: Session, actor: str, action: str, entity: str, entity_id, detail: str = "") -> None:
+    db.add(AuditLog(actor=actor, action=action, entity=entity, entity_id=str(entity_id), detail=detail))
 
 
 # --------------------------------------------------------------------------- #
@@ -133,8 +133,12 @@ def validate_target(body: schemas.TargetIn):
     }
 
 
-@app.post("/api/targets", dependencies=[Depends(require_role("operator"))], status_code=201)
-def create_target(body: schemas.TargetIn, db: Session = Depends(get_db)):
+@app.post("/api/targets", status_code=201)
+def create_target(
+    body: schemas.TargetIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     try:
         target_lib.validate(body.target_type, body.value, settings.max_cidr_hosts)
         ports = target_lib.normalize_ports(body.ports, settings.default_ports)
@@ -145,7 +149,7 @@ def create_target(body: schemas.TargetIn, db: Session = Depends(get_db)):
     t = Target(**data)
     db.add(t)
     db.flush()
-    audit(db, "target.create", "target", t.id, t.name)
+    audit(db, principal["email"], "target.create", "target", t.id, t.name)
     db.commit()
     return _target_out(db, t)
 
@@ -158,8 +162,13 @@ def get_target(target_id: int, db: Session = Depends(get_db)):
     return _target_out(db, t)
 
 
-@app.put("/api/targets/{target_id}", dependencies=[Depends(require_role("operator"))])
-def update_target(target_id: int, body: schemas.TargetIn, db: Session = Depends(get_db)):
+@app.put("/api/targets/{target_id}")
+def update_target(
+    target_id: int,
+    body: schemas.TargetIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     t = db.get(Target, target_id)
     if not t:
         raise HTTPException(404, "target not found")
@@ -171,17 +180,21 @@ def update_target(target_id: int, body: schemas.TargetIn, db: Session = Depends(
     for k, v in body.model_dump().items():
         setattr(t, k, v)
     t.ports = ports
-    audit(db, "target.update", "target", t.id, t.name)
+    audit(db, principal["email"], "target.update", "target", t.id, t.name)
     db.commit()
     return _target_out(db, t)
 
 
-@app.delete("/api/targets/{target_id}", dependencies=[Depends(require_role("operator"))], status_code=204)
-def delete_target(target_id: int, db: Session = Depends(get_db)):
+@app.delete("/api/targets/{target_id}", status_code=204)
+def delete_target(
+    target_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     t = db.get(Target, target_id)
     if not t:
         raise HTTPException(404, "target not found")
-    audit(db, "target.delete", "target", t.id, t.name)
+    audit(db, principal["email"], "target.delete", "target", t.id, t.name)
     db.delete(t)
     db.commit()
 
@@ -189,22 +202,33 @@ def delete_target(target_id: int, db: Session = Depends(get_db)):
 # --------------------------------------------------------------------------- #
 # Scan jobs
 # --------------------------------------------------------------------------- #
-@app.post("/api/targets/{target_id}/scan", dependencies=[Depends(require_role("operator"))], status_code=202)
-def start_scan(target_id: int, db: Session = Depends(get_db)):
+@app.post("/api/targets/{target_id}/scan", status_code=202)
+def start_scan(
+    target_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     t = db.get(Target, target_id)
     if not t:
         raise HTTPException(404, "target not found")
     job = enqueue_scan(db, t, trigger="manual")
+    audit(db, principal["email"], "scan.start", "scan_job", job.id, t.name)
+    db.commit()
     return schemas.ScanJobOut.model_validate(job).model_dump()
 
 
-@app.post("/api/scans/{job_id}/cancel", dependencies=[Depends(require_role("operator"))])
-def cancel_scan(job_id: int, db: Session = Depends(get_db)):
+@app.post("/api/scans/{job_id}/cancel")
+def cancel_scan(
+    job_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     job = db.get(ScanJob, job_id)
     if not job:
         raise HTTPException(404, "scan job not found")
     if job.status in ("pending", "running"):
         job.cancel_requested = True
+        audit(db, principal["email"], "scan.cancel", "scan_job", job.id)
         db.commit()
     return schemas.ScanJobOut.model_validate(job).model_dump()
 
@@ -378,34 +402,50 @@ def list_alerts(include_resolved: bool = False, db: Session = Depends(get_db)):
     return [_alert_dict(db, e) for e in db.scalars(stmt).all()]
 
 
-@app.post("/api/alerts/{alert_id}/ack", dependencies=[Depends(require_role("operator"))])
-def ack_alert(alert_id: int, db: Session = Depends(get_db)):
+@app.post("/api/alerts/{alert_id}/ack")
+def ack_alert(
+    alert_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     ev = db.get(AlertEvent, alert_id)
     if not ev:
         raise HTTPException(404, "alert not found")
     ev.acknowledged = True
+    audit(db, principal["email"], "alert.ack", "alert_event", ev.id)
     db.commit()
     return _alert_dict(db, ev)
 
 
-@app.post("/api/alerts/{alert_id}/mute", dependencies=[Depends(require_role("operator"))])
-def mute_alert(alert_id: int, body: schemas.AlertActionIn, db: Session = Depends(get_db)):
+@app.post("/api/alerts/{alert_id}/mute")
+def mute_alert(
+    alert_id: int,
+    body: schemas.AlertActionIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     ev = db.get(AlertEvent, alert_id)
     if not ev:
         raise HTTPException(404, "alert not found")
     ev.muted = True
     ev.muted_until = utcnow() + timedelta(hours=body.mute_hours) if body.mute_hours else None
+    audit(db, principal["email"], "alert.mute", "alert_event", ev.id)
     db.commit()
     return _alert_dict(db, ev)
 
 
-@app.post("/api/alerts/{alert_id}/unmute", dependencies=[Depends(require_role("operator"))])
-def unmute_alert(alert_id: int, db: Session = Depends(get_db)):
+@app.post("/api/alerts/{alert_id}/unmute")
+def unmute_alert(
+    alert_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     ev = db.get(AlertEvent, alert_id)
     if not ev:
         raise HTTPException(404, "alert not found")
     ev.muted = False
     ev.muted_until = None
+    audit(db, principal["email"], "alert.unmute", "alert_event", ev.id)
     db.commit()
     return _alert_dict(db, ev)
 
@@ -452,8 +492,12 @@ def list_channels(db: Session = Depends(get_db)):
     return [_channel_out(c) for c in db.scalars(select(NotificationChannel)).all()]
 
 
-@app.post("/api/channels", dependencies=[Depends(require_role("operator"))], status_code=201)
-def create_channel(body: schemas.ChannelIn, db: Session = Depends(get_db)):
+@app.post("/api/channels", status_code=201)
+def create_channel(
+    body: schemas.ChannelIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     data = body.model_dump()
     try:
         data["config"] = _encrypt_secrets(data.get("config") or {})
@@ -462,13 +506,18 @@ def create_channel(body: schemas.ChannelIn, db: Session = Depends(get_db)):
     ch = NotificationChannel(**data)
     db.add(ch)
     db.flush()
-    audit(db, "channel.create", "channel", ch.id, ch.name)
+    audit(db, principal["email"], "channel.create", "channel", ch.id, ch.name)
     db.commit()
     return _channel_out(ch)
 
 
-@app.put("/api/channels/{channel_id}", dependencies=[Depends(require_role("operator"))])
-def update_channel(channel_id: int, body: schemas.ChannelIn, db: Session = Depends(get_db)):
+@app.put("/api/channels/{channel_id}")
+def update_channel(
+    channel_id: int,
+    body: schemas.ChannelIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     ch = db.get(NotificationChannel, channel_id)
     if not ch:
         raise HTTPException(404, "channel not found")
@@ -485,17 +534,21 @@ def update_channel(channel_id: int, body: schemas.ChannelIn, db: Session = Depen
     ch.name, ch.channel_type, ch.enabled, ch.re_alert_hours = (
         body.name, body.channel_type, body.enabled, body.re_alert_hours)
     ch.config = new_config
-    audit(db, "channel.update", "channel", ch.id, ch.name)
+    audit(db, principal["email"], "channel.update", "channel", ch.id, ch.name)
     db.commit()
     return _channel_out(ch)
 
 
-@app.delete("/api/channels/{channel_id}", dependencies=[Depends(require_role("operator"))], status_code=204)
-def delete_channel(channel_id: int, db: Session = Depends(get_db)):
+@app.delete("/api/channels/{channel_id}", status_code=204)
+def delete_channel(
+    channel_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     ch = db.get(NotificationChannel, channel_id)
     if not ch:
         raise HTTPException(404, "channel not found")
-    audit(db, "channel.delete", "channel", ch.id, ch.name)
+    audit(db, principal["email"], "channel.delete", "channel", ch.id, ch.name)
     db.delete(ch)
     db.commit()
 
@@ -532,17 +585,62 @@ def get_settings(db: Session = Depends(get_db)):
     return {r.key: r.value.get("value") for r in rows}
 
 
-@app.put("/api/settings", dependencies=[Depends(require_role("operator"))])
-def update_settings(body: dict, db: Session = Depends(get_db)):
+@app.put("/api/settings")
+def update_settings(
+    body: dict,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     for key, value in body.items():
         row = db.get(SystemSetting, key)
         if row is None:
             db.add(SystemSetting(key=key, value={"value": value}))
         else:
             row.value = {"value": value}
-    audit(db, "settings.update", "settings", "-", ",".join(body.keys()))
+    audit(db, principal["email"], "settings.update", "settings", "-", ",".join(body.keys()))
     db.commit()
     return get_settings(db)
+
+
+# --------------------------------------------------------------------------- #
+# Audit log (admin only)
+# --------------------------------------------------------------------------- #
+def _audit_dict(row: AuditLog) -> dict:
+    return {
+        "id": row.id,
+        "actor": row.actor,
+        "action": row.action,
+        "entity": row.entity,
+        "entity_id": row.entity_id,
+        "detail": row.detail,
+        "created_at": row.created_at,
+    }
+
+
+@app.get("/api/audit", dependencies=[Depends(require_role("admin"))])
+def list_audit(
+    limit: int = Query(100, le=1000),
+    offset: int = Query(0, ge=0),
+    actor: str | None = None,
+    entity: str | None = None,
+    action: str | None = None,
+    since: datetime | None = None,
+    db: Session = Depends(get_db),
+):
+    stmt = select(AuditLog)
+    if actor:
+        stmt = stmt.where(AuditLog.actor == actor)
+    if entity:
+        stmt = stmt.where(AuditLog.entity == entity)
+    if action:
+        stmt = stmt.where(AuditLog.action == action)
+    if since:
+        stmt = stmt.where(AuditLog.created_at >= since)
+    total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows = db.scalars(
+        stmt.order_by(AuditLog.created_at.desc()).limit(limit).offset(offset)
+    ).all()
+    return {"total": total, "items": [_audit_dict(r) for r in rows]}
 
 
 # --------------------------------------------------------------------------- #

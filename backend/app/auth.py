@@ -145,6 +145,25 @@ def require_role(min_role: str):
     return _dependency
 
 
+def actor(request: Request) -> str:
+    """Best-effort actor label for audit logging, using the same resolution
+    order as `require_role` (session first, then bearer), but never raises —
+    callers that need auth enforcement should still depend on `require_role`.
+
+    Returns the session user's email, "service-account" for a valid bearer
+    token, or "system" when neither is present (e.g. scheduler-driven calls
+    with no request/principal at all).
+    """
+    user = current_user(request)
+    if user is not None:
+        return user.get("email") or "system"
+    authorization = request.headers.get("authorization", "")
+    token = authorization.removeprefix("Bearer ").strip()
+    if settings.api_key and token == settings.api_key:
+        return "service-account"
+    return "system"
+
+
 def _upsert_user(db: Session, email: str) -> User:
     """Fetch-or-create a User by email. Raises 403 if the existing row is disabled."""
     user = db.scalar(select(User).where(User.email == email))
