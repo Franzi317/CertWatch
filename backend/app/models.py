@@ -299,6 +299,35 @@ class ManagedCertificate(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class LifecycleOrder(Base):
+    """A single issue/renew/revoke operation on a ManagedCertificate, driven
+    through an approval-gated state machine (see `app.lifecycle`). Renewals
+    are approval-gated by project decision; revoke requires admin approval
+    (two-person rule) -- both enforced in `lifecycle.approve`, not here.
+
+    `transitions` is an append-only audit trail of every status change:
+    a list of `{"from", "to", "at", "detail"}` dicts."""
+
+    __tablename__ = "lifecycle_orders"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    managed_certificate_id: Mapped[int] = mapped_column(ForeignKey("managed_certificates.id"))
+    # action: issue | renew | revoke
+    action: Mapped[str] = mapped_column(String(8))
+    # status: pending_approval | approved | queued | issuing | deploying |
+    #         verifying | complete | failed | rolled_back (validated in the
+    #         app layer via lifecycle.ALLOWED_TRANSITIONS, not the DB)
+    status: Mapped[str] = mapped_column(String(20), default="pending_approval")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    approved_by: Mapped[str] = mapped_column(String(255), default="")
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error: Mapped[str] = mapped_column(Text, default="")
+    correlation_id: Mapped[str] = mapped_column(String(36), default="")
+    transitions: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class AcmeChallenge(Base):
     """Pending ACME HTTP-01 challenges. The public `/.well-known/acme-challenge/{token}`
     route (main.py) serves `key_authorization` for a row here; the ACME adapter

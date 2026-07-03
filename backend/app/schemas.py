@@ -146,3 +146,24 @@ class ManageIn(BaseModel):
     Certificate into a ManagedCertificate under the given issuer/policy."""
     issuer_id: int
     renewal_policy_id: int
+
+
+class LifecycleOrderIn(BaseModel):
+    managed_certificate_id: int
+    action: str  # issue | renew | revoke
+
+
+class LifecycleOrderOut(BaseModel):
+    id: int
+    managed_certificate_id: int
+    action: str
+    status: str
+    attempts: int
+    approved_by: str
+    approved_at: datetime | None = None
+    error: str
+    correlation_id: str
+    transitions: list = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+    model_config = {"from_attributes": True}

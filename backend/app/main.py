@@ -18,7 +18,7 @@ from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import schemas, targets as target_lib
+from . import lifecycle, schemas, targets as target_lib
 from .alerts import dispatch_alerts, evaluate_alerts
 from .auth import require_role, router as auth_router
 from .config import settings
@@ -33,6 +33,7 @@ from .models import (
     CertificateObservation,
     Endpoint,
     Issuer,
+    LifecycleOrder,
     ManagedCertificate,
     NotificationChannel,
     RenewalPolicy,
@@ -843,6 +844,81 @@ def promote_certificate(
     audit(db, principal["email"], "managed_cert.promote", "managed_certificate", m.id, cert.common_name)
     db.commit()
     return _managed_cert_out(db, m)
+
+
+# --------------------------------------------------------------------------- #
+# Lifecycle orders (Task 7): approval-gated issue/renew/revoke state machine
+# --------------------------------------------------------------------------- #
+LIFECYCLE_ACTIONS = {"issue", "renew", "revoke"}
+
+
+@app.get("/api/lifecycle/orders", dependencies=[Depends(require_role("viewer"))])
+def list_lifecycle_orders(db: Session = Depends(get_db)):
+    rows = db.scalars(select(LifecycleOrder).order_by(LifecycleOrder.id.desc())).all()
+    return [schemas.LifecycleOrderOut.model_validate(o).model_dump() for o in rows]
+
+
+@app.get("/api/lifecycle/orders/{order_id}", dependencies=[Depends(require_role("viewer"))])
+def get_lifecycle_order(order_id: int, db: Session = Depends(get_db)):
+    order = db.get(LifecycleOrder, order_id)
+    if not order:
+        raise HTTPException(404, "lifecycle order not found")
+    return schemas.LifecycleOrderOut.model_validate(order).model_dump()
+
+
+@app.post("/api/lifecycle/orders", status_code=201)
+def create_lifecycle_order(
+    body: schemas.LifecycleOrderIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    if body.action not in LIFECYCLE_ACTIONS:
+        raise HTTPException(400, f"action must be one of {sorted(LIFECYCLE_ACTIONS)}")
+    managed_cert = db.get(ManagedCertificate, body.managed_certificate_id)
+    if not managed_cert:
+        raise HTTPException(404, "managed certificate not found")
+    order = lifecycle.create_order(db, managed_cert, body.action, principal["email"])
+    audit(db, principal["email"], "lifecycle_order.create", "lifecycle_order", order.id, order.action)
+    db.commit()
+    return schemas.LifecycleOrderOut.model_validate(order).model_dump()
+
+
+@app.post("/api/lifecycle/orders/{order_id}/approve")
+def approve_lifecycle_order(
+    order_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    order = db.get(LifecycleOrder, order_id)
+    if not order:
+        raise HTTPException(404, "lifecycle order not found")
+    try:
+        lifecycle.approve(db, order, principal["email"], is_admin=(principal["role"] == "admin"))
+    except PermissionError:
+        raise HTTPException(403, "revoke approval requires admin")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    audit(db, principal["email"], "lifecycle_order.approve", "lifecycle_order", order.id, order.status)
+    db.commit()
+    return schemas.LifecycleOrderOut.model_validate(order).model_dump()
+
+
+@app.post("/api/lifecycle/orders/{order_id}/reject")
+def reject_lifecycle_order(
+    order_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    order = db.get(LifecycleOrder, order_id)
+    if not order:
+        raise HTTPException(404, "lifecycle order not found")
+    try:
+        lifecycle.reject(db, order, principal["email"])
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    audit(db, principal["email"], "lifecycle_order.reject", "lifecycle_order", order.id, order.status)
+    db.commit()
+    return schemas.LifecycleOrderOut.model_validate(order).model_dump()
 
 
 # --------------------------------------------------------------------------- #
