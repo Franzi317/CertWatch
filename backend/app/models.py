@@ -240,6 +240,24 @@ class WorkQueue(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class Issuer(Base):
+    """A configured CA (AD CS or ACME) that certificate requests are issued
+    against. `config` holds non-secret adapter fields plus secret fields the
+    adapter encrypts/decrypts via `app.secrets` before use."""
+
+    __tablename__ = "issuers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    # issuer_type: adcs | acme
+    issuer_type: Mapped[str] = mapped_column(String(16))
+    config: Mapped[dict] = mapped_column(JSON, default=dict)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_test_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_test_ok: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     __table_args__ = (Index("ix_audit_logs_created_at", "created_at"),)
