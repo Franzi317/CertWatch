@@ -43,15 +43,19 @@ def get_adapter(issuer: "Issuer") -> IssuerAdapter:
 
     if issuer_type == "adcs":
         try:
-            from app.issuers.adcs import AdcsAdapter
-        except ImportError as e:
+            from app.issuers.adcs import ADCSAdapter
+        except ModuleNotFoundError as e:
+            if e.name != "app.issuers.adcs":
+                raise
             raise IssuerError(f"unknown issuer type: {issuer_type}") from e
-        return AdcsAdapter(issuer)
+        return ADCSAdapter(issuer)
 
     if issuer_type == "acme":
         try:
             from app.issuers.acme_http01 import AcmeHttp01Adapter
-        except ImportError as e:
+        except ModuleNotFoundError as e:
+            if e.name != "app.issuers.acme_http01":
+                raise
             raise IssuerError(f"unknown issuer type: {issuer_type}") from e
         return AcmeHttp01Adapter(issuer)
 
