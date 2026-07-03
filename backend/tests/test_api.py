@@ -96,6 +96,42 @@ def test_channel_secrets_are_scrubbed(client):
     assert client.get("/api/channels").json()[0]["config_summary"]["host"] == "smtp2.example.com"
 
 
+def test_channel_secrets_stored_encrypted(client):
+    from app import secrets as app_secrets
+    from app.db import SessionLocal
+    from app.models import NotificationChannel
+
+    plaintext_password = "s3cret"
+    plaintext_url = "https://hooks.example.com/services/T00/B00/XXXX"
+    r = client.post("/api/channels", json={
+        "name": "hook", "channel_type": "webhook",
+        "config": {"url": plaintext_url, "password": plaintext_password, "recipients": ["a@b.c"]},
+    })
+    assert r.status_code == 201
+    cid = r.json()["id"]
+
+    # Bypass the API and read the persisted row directly, so a regression
+    # that drops the encrypt() call (but leaves config_summary scrubbing
+    # intact) would still be caught.
+    session = SessionLocal()
+    try:
+        row = session.get(NotificationChannel, cid)
+        stored_password = row.config["password"]
+        stored_url = row.config["url"]
+    finally:
+        session.close()
+
+    assert app_secrets.is_encrypted(stored_password)
+    assert stored_password != plaintext_password
+
+    assert app_secrets.is_encrypted(stored_url)
+    assert stored_url != plaintext_url
+
+    # and the ciphertext round-trips back to the original plaintext
+    assert app_secrets.decrypt(stored_password) == plaintext_password
+    assert app_secrets.decrypt(stored_url) == plaintext_url
+
+
 def test_dashboard_summary(client):
     body = client.get("/api/dashboard").json()
     for key in ("total_certificates", "total_endpoints", "expiring_90d", "expired", "failed_scans"):
