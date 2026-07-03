@@ -12,7 +12,7 @@ so values are always current -- no background refresh loop needed.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import timedelta, timezone
 
 from fastapi import FastAPI
 from prometheus_client import REGISTRY
@@ -34,6 +34,38 @@ _EXPIRY_WINDOWS_DAYS = (7, 30, 90)
 _HEARTBEAT_SENTINEL_SECONDS = 1e9  # emitted when the queue has never had activity
 
 
+def _empty_gauges():
+    """Build the four zeroed/sentinel GaugeMetricFamily objects shared by the
+    normal and exception paths of `CertWatchCollector.collect()`.
+
+    Returns (queue_depth, certs_expiring, scan_jobs_total, heartbeat) -- fresh
+    GaugeMetricFamily instances with the same names/labels used elsewhere in
+    this module, ready for the caller to populate (or leave zeroed).
+    """
+    queue_depth = GaugeMetricFamily(
+        "certwatch_queue_depth",
+        "Number of WorkQueue rows by status",
+        labels=["status"],
+    )
+    certs_expiring = GaugeMetricFamily(
+        "certwatch_certs_expiring_days",
+        "Number of certificates with not_after within the given day window",
+        labels=["window"],
+    )
+    scan_jobs_total = GaugeMetricFamily(
+        "certwatch_scan_jobs_total",
+        "Number of ScanJob rows by status",
+        labels=["status"],
+    )
+    heartbeat = GaugeMetricFamily(
+        "certwatch_worker_last_heartbeat_seconds",
+        "Age in seconds of the most recent worker activity (approximated "
+        "via the newest non-queued WorkQueue.updated_at; see ponytail note "
+        "in app/metrics.py)",
+    )
+    return queue_depth, certs_expiring, scan_jobs_total, heartbeat
+
+
 class CertWatchCollector:
     """Custom prometheus_client collector for CertWatch domain gauges.
 
@@ -43,27 +75,7 @@ class CertWatchCollector:
     """
 
     def collect(self):
-        queue_depth = GaugeMetricFamily(
-            "certwatch_queue_depth",
-            "Number of WorkQueue rows by status",
-            labels=["status"],
-        )
-        certs_expiring = GaugeMetricFamily(
-            "certwatch_certs_expiring_days",
-            "Number of certificates with not_after within the given day window",
-            labels=["window"],
-        )
-        scan_jobs_total = GaugeMetricFamily(
-            "certwatch_scan_jobs_total",
-            "Number of ScanJob rows by status",
-            labels=["status"],
-        )
-        heartbeat = GaugeMetricFamily(
-            "certwatch_worker_last_heartbeat_seconds",
-            "Age in seconds of the most recent worker activity (approximated "
-            "via the newest non-queued WorkQueue.updated_at; see ponytail note "
-            "in app/metrics.py)",
-        )
+        queue_depth, certs_expiring, scan_jobs_total, heartbeat = _empty_gauges()
 
         try:
             self._populate(queue_depth, certs_expiring, scan_jobs_total, heartbeat)
@@ -71,21 +83,7 @@ class CertWatchCollector:
             # Never let a scrape 500 because the DB hiccuped -- log and fall
             # back to zeroed/sentinel metrics instead of raising.
             log.exception("certwatch metrics collection failed; emitting zeros")
-            queue_depth = GaugeMetricFamily(
-                "certwatch_queue_depth", "Number of WorkQueue rows by status", labels=["status"]
-            )
-            certs_expiring = GaugeMetricFamily(
-                "certwatch_certs_expiring_days",
-                "Number of certificates with not_after within the given day window",
-                labels=["window"],
-            )
-            scan_jobs_total = GaugeMetricFamily(
-                "certwatch_scan_jobs_total", "Number of ScanJob rows by status", labels=["status"]
-            )
-            heartbeat = GaugeMetricFamily(
-                "certwatch_worker_last_heartbeat_seconds",
-                "Age in seconds of the most recent worker activity (approximated)",
-            )
+            queue_depth, certs_expiring, scan_jobs_total, heartbeat = _empty_gauges()
             for status in _QUEUE_STATUSES:
                 queue_depth.add_metric([status], 0)
             for days in _EXPIRY_WINDOWS_DAYS:
@@ -129,8 +127,7 @@ class CertWatchCollector:
             if last_activity is not None:
                 if last_activity.tzinfo is None:
                     # SQLite drops tzinfo on round-trip even for DateTime(timezone=True).
-                    from datetime import timezone as _tz
-                    last_activity = last_activity.replace(tzinfo=_tz.utc)
+                    last_activity = last_activity.replace(tzinfo=timezone.utc)
                 age = max((now - last_activity).total_seconds(), 0.0)
                 heartbeat.add_metric([], age)
             else:
@@ -146,16 +143,17 @@ def setup_metrics(app: FastAPI) -> None:
     """Instrument `app` with default HTTP metrics + CertWatch gauges and
     expose them, unauthenticated, at GET /metrics.
 
-    Idempotent: safe to call more than once in the same process (e.g. if a
-    test session imports/creates the app repeatedly) -- guarded so we never
-    hit prometheus_client's "Duplicated timeseries in CollectorRegistry"
-    error on repeat registration.
+    Idempotent: the entire setup (instrumentation, /metrics exposition, and
+    custom collector registration) runs only on the first call per process.
+    A second call on the same `app` (or a different `app` in the same
+    process) is a no-op -- this avoids both prometheus_client's "Duplicated
+    timeseries in CollectorRegistry" error and duplicate instrumentator
+    middleware being added to `app`.
     """
     global _METRICS_REGISTERED
 
-    Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
-
     if not _METRICS_REGISTERED:
+        Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
         try:
             REGISTRY.register(CertWatchCollector())
         except ValueError:

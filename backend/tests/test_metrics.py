@@ -5,6 +5,8 @@ session cookies), so the default `client` fixture -- authenticated as admin
 per conftest.py -- works fine here regardless of auth state.
 """
 from app.db import SessionLocal
+from app.main import app
+from app.metrics import setup_metrics
 from app.models import WorkQueue
 
 
@@ -36,3 +38,12 @@ def test_metrics_endpoint_ok_when_db_empty(client):
     r = client.get("/metrics")
     assert r.status_code == 200
     assert 'certwatch_queue_depth{status="queued"} 0.0' in r.text
+
+
+def test_setup_metrics_is_idempotent(client):
+    # Calling setup_metrics twice on the same app must not raise (e.g. no
+    # duplicate instrumentator middleware, no "Duplicated timeseries" error).
+    setup_metrics(app)
+
+    r = client.get("/metrics")
+    assert r.status_code == 200
