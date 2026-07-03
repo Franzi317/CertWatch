@@ -27,27 +27,33 @@ def init_db() -> None:
     from . import models  # noqa: F401  (register mappers)
 
     models.Base.metadata.create_all(bind=engine)
-    _ensure_columns()
 
 
-# ponytail: additive dev-migration for new nullable/defaulted columns so an existing
-# SQLite DB keeps its data. Swap in Alembic if schema changes get non-trivial.
-_ADDED_COLUMNS = {
-    "targets": {
-        "schedule_type": "VARCHAR(16) DEFAULT 'interval'",
-        "schedule_time": "VARCHAR(5) DEFAULT '00:00'",
-        "schedule_day": "INTEGER DEFAULT 0",
-    },
-}
+def run_migrations() -> None:
+    """Run Alembic migrations up to head. Intended for production startup, where
+    schema changes go through versioned migrations instead of create_all().
 
+    Handles two starting states:
+    - Fresh DB (no tables at all): alembic runs 0001..head normally.
+    - Pre-Phase-0 DB (created by the old unconditional create_all(), so the app
+      tables already exist physically but there's no alembic_version table):
+      stamp it at 0001 (the baseline migration) so alembic knows the schema is
+      already at that revision, then upgrade the rest of the way to head.
+    """
+    import pathlib
 
-def _ensure_columns() -> None:
-    from sqlalchemy import inspect, text
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import inspect
+
+    backend_dir = pathlib.Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend_dir / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend_dir / "alembic"))
+    cfg.set_main_option("sqlalchemy.url", settings.database_url)
 
     insp = inspect(engine)
-    with engine.begin() as conn:
-        for table, cols in _ADDED_COLUMNS.items():
-            existing = {c["name"] for c in insp.get_columns(table)}
-            for name, ddl in cols.items():
-                if name not in existing:
-                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+    tables = set(insp.get_table_names())
+    if "targets" in tables and "alembic_version" not in tables:
+        # pre-Phase-0 DB: baseline schema already physically present -> stamp it, then upgrade
+        command.stamp(cfg, "0001")
+    command.upgrade(cfg, "head")

@@ -1,0 +1,358 @@
+# Phase 0 — Foundation Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Every task is TDD: write the failing test, watch it fail, implement, watch it pass, commit.
+
+**Goal:** Break CertWatch's single-node MVP ceiling — add migrations, real user auth (Entra OIDC), RBAC, actor-attributed audit, encrypted secrets, a durable Postgres-backed job queue with a separate worker, and metrics — without regressing the existing scanner/alerting.
+
+**Architecture:** Evolutionary. Keep FastAPI + SQLAlchemy 2 + React. Add Alembic for schema. Auth = Starlette signed-cookie session populated by an Authlib OIDC flow (mocked in tests). RBAC = a single `role` enum on `User` + a `require_role` dependency. Job execution moves from in-process threads to a `WorkQueue` table claimed via `FOR UPDATE SKIP LOCKED` by a `python -m app.worker` process; an embedded-worker mode preserves the one-container dev quickstart.
+
+**Tech Stack:** Python 3.13, FastAPI, SQLAlchemy 2, Alembic, PostgreSQL 16 (prod) / SQLite (dev+test), Authlib (OIDC), `bcrypt` (break-glass password hash), `cryptography` Fernet (secrets), `prometheus-fastapi-instrumentator` (metrics), React 18 + Vite.
+
+## Global Constraints
+
+- **No multi-tenancy.** No `Tenant` entity, no tenant scoping, no org headers.
+- **SSO is Entra ID (OIDC) only.** No generic multi-IdP abstraction. Build against a mock OIDC provider now; real-tenant config is env-driven (`CERTWATCH_ENTRA_TENANT_ID`, `CERTWATCH_ENTRA_CLIENT_ID`, `CERTWATCH_ENTRA_CLIENT_SECRET`, `CERTWATCH_ENTRA_REDIRECT_URI`) and validated in a later manual pass.
+- **Roles:** exactly three, `admin | operator | viewer`, as a string enum column on `User`. Determined from Entra **security group** object-IDs via env vars `CERTWATCH_ENTRA_ADMIN_GROUP`, `CERTWATCH_ENTRA_OPERATOR_GROUP`, `CERTWATCH_ENTRA_VIEWER_GROUP` (comma-separated group OIDs each). No local role-management UI in Phase 0.
+- **Session = signed HttpOnly cookie** via Starlette `SessionMiddleware`. Cookie flags: `HttpOnly`, `SameSite=Lax`, `Secure` when `CERTWATCH_COOKIE_SECURE=true` (default true; false for local http dev). Session secret from `CERTWATCH_SESSION_SECRET`.
+- **Existing `CERTWATCH_API_KEY`** static bearer token survives as a **service-account credential mapped to role `operator`** for API automation.
+- **Secrets never returned in cleartext** by any API. Issuer/connector/channel credentials stored Fernet-encrypted with `CERTWATCH_MASTER_KEY`.
+- **Postgres is the only production datastore.** Queue uses `FOR UPDATE SKIP LOCKED`. SQLite is dev/test only; on SQLite the queue claim degrades to a plain locked select (single embedded worker, no contention).
+- Python 3.11+ floor, 3.13 recommended.
+- Every mutation endpoint requires auth (`require_role(operator)` minimum) and writes an `AuditLog` row with `actor`.
+- Do not break the 35 existing tests. Run the full suite (`python -m pytest -q` in `backend/`) at the end of every task.
+- Backend venv python: `backend/.venv/Scripts/python.exe`. All test commands run from `backend/`.
+
+## File Structure
+
+- `backend/alembic.ini`, `backend/alembic/env.py`, `backend/alembic/versions/*.py` — migrations (Task 1).
+- `backend/app/secrets.py` — Fernet encrypt/decrypt helper (Task 2).
+- `backend/app/auth.py` — OIDC client, session helpers, `require_role`, login/callback/logout routes (Tasks 4, 5).
+- `backend/app/models.py` — add `User`, `WorkQueue`; extend `AuditLog` (Tasks 3, 6, 7).
+- `backend/app/worker.py` — worker loop + claim (Tasks 7, 8).
+- `backend/app/metrics.py` — Prometheus gauges (Task 9).
+- `backend/app/config.py` — new settings (all tasks).
+- `backend/app/main.py` — wire middleware, routers, role guards, metrics (Tasks 4–9).
+- `frontend/src/pages/Login.tsx`, `frontend/src/auth.tsx` — login UX (Task 10).
+- Tests under `backend/tests/test_*.py` per task.
+
+---
+
+## Task 1: Alembic migrations + baseline
+
+**Files:**
+- Create: `backend/alembic.ini`, `backend/alembic/env.py`, `backend/alembic/script.py.mako`, `backend/alembic/versions/0001_baseline.py`
+- Modify: `backend/requirements.txt` (add `alembic==1.14.0`), `backend/app/db.py`
+- Test: `backend/tests/test_migrations.py`
+
+**Interfaces:**
+- Produces: `alembic upgrade head` creates the full current schema from an empty DB. `backend/app/db.py::init_db()` unchanged for SQLite tests (`create_all`) but the `_ensure_columns()` hack is removed and its three columns (`schedule_type`, `schedule_time`, `schedule_day`) are folded into the baseline migration. `run_migrations()` helper added for prod use.
+
+**Details:**
+- `alembic/env.py` must import `from app.models import Base` and set `target_metadata = Base.metadata`; read URL from `app.config.settings.database_url` (not `alembic.ini`), and set `render_as_batch=True` in `context.configure(...)` so SQLite ALTERs work.
+- Baseline migration `0001_baseline` is generated by autogenerate against the current models (all 9 tables). Verify it includes `targets.schedule_type/schedule_time/schedule_day`.
+- Remove `_ADDED_COLUMNS` and `_ensure_columns` from `db.py`; `init_db()` keeps `create_all` (tests/SQLite quickstart). Add `def run_migrations() -> None` that runs `alembic upgrade head` programmatically via `alembic.config.main` or the `Config`/`command.upgrade` API.
+
+- [ ] **Step 1: Write failing test** — `test_migrations.py`:
+
+```python
+import subprocess, sys, os, sqlite3, tempfile, pathlib
+
+BACKEND = pathlib.Path(__file__).resolve().parents[1]
+
+def test_upgrade_head_creates_all_tables(tmp_path):
+    db = tmp_path / "m.db"
+    env = {**os.environ, "CERTWATCH_DATABASE_URL": f"sqlite:///{db}"}
+    r = subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"],
+                       cwd=BACKEND, env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    con = sqlite3.connect(db)
+    names = {row[0] for row in con.execute("select name from sqlite_master where type='table'")}
+    assert {"targets", "certificates", "endpoints", "scan_jobs", "alert_events",
+            "notification_channels", "system_settings", "audit_logs",
+            "certificate_observations"} <= names
+    cols = {row[1] for row in con.execute("pragma table_info(targets)")}
+    assert {"schedule_type", "schedule_time", "schedule_day"} <= cols
+```
+
+- [ ] **Step 2: Run test, verify it fails** — `python -m pytest tests/test_migrations.py -q` → FAIL (no alembic config).
+- [ ] **Step 3: Add alembic dep, scaffold `alembic/`, write `env.py` + baseline migration, edit `db.py`.**
+- [ ] **Step 4: Run test, verify pass.** Also run full suite: `python -m pytest -q` → all pass.
+- [ ] **Step 5: Commit** — `git add -A && git commit -m "feat: add Alembic migrations with baseline schema"`
+
+---
+
+## Task 2: Fernet secrets helper + encrypt channel secrets
+
+**Files:**
+- Create: `backend/app/secrets.py`, `backend/tests/test_secrets.py`
+- Modify: `backend/app/config.py`, `backend/app/main.py` (channel read/write paths), `backend/alembic/versions/0002_encrypt_channel_secrets.py`
+
+**Interfaces:**
+- Produces:
+  - `app.secrets.encrypt(plaintext: str) -> str` — returns a `"enc:v1:"`-prefixed token.
+  - `app.secrets.decrypt(token: str) -> str` — reverses `encrypt`; returns the input unchanged if it lacks the `enc:v1:` prefix (back-compat for pre-encryption rows / plaintext).
+  - `app.secrets.is_encrypted(value: str) -> bool`.
+  - `settings.master_key: str` from `CERTWATCH_MASTER_KEY`. If empty, `encrypt` raises `SecretsNotConfigured` — but only channel-secret writes call it, so an unconfigured dev instance without SMTP still boots.
+- Consumes: nothing from prior tasks.
+
+**Details:**
+- Fernet key derivation: `CERTWATCH_MASTER_KEY` is a urlsafe-base64 32-byte key (document `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`). Do not derive from a passphrase in Phase 0.
+- In `main.py`, the channel `_SECRET_KEYS = {"password", "url"}` values are `encrypt()`-ed on create/update and `decrypt()`-ed only where actually used (in `test_channel` and in `alerts.py`/`notify.py` dispatch). `_channel_out` already scrubs them — keep that.
+- Migration `0002` encrypts existing plaintext channel secret fields in place (data migration: load rows, encrypt password/url if not already `enc:v1:`, save).
+
+- [ ] **Step 1: Failing test** — `test_secrets.py`:
+
+```python
+import pytest
+from app import secrets as s
+
+def test_roundtrip(monkeypatch):
+    from cryptography.fernet import Fernet
+    monkeypatch.setenv("CERTWATCH_MASTER_KEY", Fernet.generate_key().decode())
+    s._reset_cache()  # force re-read of env
+    tok = s.encrypt("hunter2")
+    assert tok.startswith("enc:v1:")
+    assert s.is_encrypted(tok)
+    assert s.decrypt(tok) == "hunter2"
+
+def test_decrypt_passthrough_plaintext():
+    assert s.decrypt("plain-not-encrypted") == "plain-not-encrypted"
+
+def test_encrypt_unconfigured_raises(monkeypatch):
+    monkeypatch.setenv("CERTWATCH_MASTER_KEY", "")
+    s._reset_cache()
+    with pytest.raises(s.SecretsNotConfigured):
+        s.encrypt("x")
+```
+
+- [ ] **Step 2: Run, verify fail.**
+- [ ] **Step 3: Implement `secrets.py`** (cache the `Fernet` instance; `_reset_cache()` for tests; read key from `settings.master_key`). Wire encrypt/decrypt into `main.py` channel paths and `notify.py`/`alerts.py` consumption. Write migration `0002`.
+- [ ] **Step 4: Run `test_secrets.py` + full suite.** All pass.
+- [ ] **Step 5: Commit** — `feat: envelope-encrypt notification channel secrets (Fernet)`
+
+---
+
+## Task 3: User model + break-glass password hash
+
+**Files:**
+- Create: `backend/tests/test_users.py`, `backend/alembic/versions/0003_users.py`
+- Modify: `backend/app/models.py`, `backend/app/config.py`, `backend/requirements.txt` (add `bcrypt==4.2.1`)
+
+**Interfaces:**
+- Produces:
+  - `models.User`: `id int pk`, `email str unique index`, `display_name str`, `role str` (default `"viewer"`), `source str` (`"entra"|"local"`), `disabled bool` (default False), `last_login_at datetime|None`, `created_at`. Role is a plain `String(16)`; validate against `{"admin","operator","viewer"}` in the app, not a DB enum (SQLite portability).
+  - `ROLE_RANK = {"viewer": 0, "operator": 1, "admin": 2}` in `models.py`.
+  - `settings.admin_email: str` (`CERTWATCH_ADMIN_EMAIL`) and `settings.admin_password_hash: str` (`CERTWATCH_ADMIN_PASSWORD_HASH`, a bcrypt hash) for the break-glass local admin.
+- Consumes: Task 1 (migrations).
+
+**Details:**
+- Migration `0003` creates the `users` table.
+- No password stored in DB in Phase 0 — the single break-glass admin is validated against the env hash (Task 4). `User` rows are for Entra-sourced users + optionally an auto-provisioned local admin row on first break-glass login.
+
+- [ ] **Step 1: Failing test** — `test_users.py` asserting a `User` can be created with defaults (`role=="viewer"`, `disabled is False`) and that `ROLE_RANK["admin"] > ROLE_RANK["operator"] > ROLE_RANK["viewer"]`. Use the existing test DB fixture pattern from `conftest.py`.
+- [ ] **Step 2: Run, verify fail.**
+- [ ] **Step 3: Add `User` model, `ROLE_RANK`, config fields, migration `0003`.**
+- [ ] **Step 4: Run test + full suite.**
+- [ ] **Step 5: Commit** — `feat: add User model and break-glass admin config`
+
+---
+
+## Task 4: OIDC login flow (mock IdP) + session
+
+**Files:**
+- Create: `backend/app/auth.py`, `backend/tests/test_auth.py`
+- Modify: `backend/app/main.py`, `backend/app/config.py`, `backend/requirements.txt` (add `authlib==1.4.0`, `itsdangerous==2.2.0`)
+
+**Interfaces:**
+- Produces:
+  - `SessionMiddleware` added in `main.py` with `secret_key=settings.session_secret`, `https_only=settings.cookie_secure`, `same_site="lax"`.
+  - Routes: `GET /api/auth/login` (redirects to IdP authorize URL), `GET /api/auth/callback` (exchanges code, provisions/updates `User`, sets session), `POST /api/auth/logout` (clears session), `GET /api/auth/me` (returns current user or 401), `POST /api/auth/local` (break-glass: form email+password → bcrypt check against env hash → admin session).
+  - `auth.current_user(request) -> dict | None` reads `request.session` → `{"id","email","role"}`.
+  - `auth.map_groups_to_role(group_oids: list[str]) -> str` — highest role whose configured group set intersects `group_oids`, else `"viewer"`.
+- Consumes: Tasks 2 (secrets not needed here), 3 (`User`, `ROLE_RANK`).
+
+**Details:**
+- Use Authlib's `StarletteOAuth2App` / `OAuth` registry pointed at Entra's discovery URL `https://login.microsoftonline.com/{tenant}/v2.0/.well-known/openid-configuration`. For **tests**, do not hit the network: structure `auth.py` so the token/userinfo parsing is a separate pure function `parse_id_claims(claims: dict) -> User-ish dict` and the group→role mapping is pure; the callback calls a thin `_fetch_token(request)` that tests monkeypatch to return canned claims including `groups` (list of OIDs) and `preferred_username`/`email`/`name`/`oid`.
+- Callback provisions: upsert `User` by email, set `display_name`, `role = map_groups_to_role(claims["groups"])`, `source="entra"`, `last_login_at=now`. If `disabled`, refuse (403). Store `{"id","email","role"}` in session.
+- Break-glass `/api/auth/local`: compare submitted password to `settings.admin_password_hash` via `bcrypt.checkpw`; on success upsert a `User(email=settings.admin_email, role="admin", source="local")` and set session. Rate-limit note left as a `ponytail:` comment (add real limiter only if exposed to the internet).
+
+- [ ] **Step 1: Failing tests** — `test_auth.py`:
+
+```python
+def test_group_mapping(monkeypatch):
+    monkeypatch.setenv("CERTWATCH_ENTRA_ADMIN_GROUP", "g-admin")
+    monkeypatch.setenv("CERTWATCH_ENTRA_OPERATOR_GROUP", "g-op1,g-op2")
+    from app import auth; auth._reset_cache()
+    assert auth.map_groups_to_role(["g-op2"]) == "operator"
+    assert auth.map_groups_to_role(["g-admin", "g-op1"]) == "admin"
+    assert auth.map_groups_to_role(["unknown"]) == "viewer"
+
+def test_callback_provisions_user_and_sets_session(client, monkeypatch):
+    monkeypatch.setenv("CERTWATCH_ENTRA_ADMIN_GROUP", "g-admin")
+    from app import auth; auth._reset_cache()
+    monkeypatch.setattr(auth, "_fetch_token", lambda req: {
+        "email": "jane@corp.com", "name": "Jane", "oid": "x", "groups": ["g-admin"]})
+    r = client.get("/api/auth/callback?code=abc&state=xyz")
+    me = client.get("/api/auth/me")
+    assert me.status_code == 200 and me.json()["role"] == "admin"
+
+def test_me_unauthenticated_401(client):
+    assert client.get("/api/auth/me").status_code == 401
+```
+
+(The `client` fixture must be updated in `conftest.py` to follow redirects=False and share a cookie jar — extend the existing fixture; note this in the task report.)
+
+- [ ] **Step 2: Run, verify fail.**
+- [ ] **Step 3: Implement `auth.py` + wire middleware/routes + config fields (`session_secret`, `cookie_secure`, entra + group envs).**
+- [ ] **Step 4: Run `test_auth.py` + full suite.**
+- [ ] **Step 5: Commit** — `feat: Entra OIDC login flow with signed-cookie sessions and break-glass admin`
+
+---
+
+## Task 5: RBAC enforcement across the API
+
+**Files:**
+- Modify: `backend/app/auth.py` (add `require_role`), `backend/app/main.py` (replace `require_auth` on every route)
+- Test: `backend/tests/test_rbac.py`
+
+**Interfaces:**
+- Produces: `auth.require_role(min_role: str) -> Callable` FastAPI dependency. Resolution order: (1) valid session → use session role; (2) `Authorization: Bearer <CERTWATCH_API_KEY>` → role `operator`; (3) neither → 401. If authenticated but role rank < `min_role` rank → 403.
+- Consumes: Tasks 3 (`ROLE_RANK`), 4 (session).
+
+**Details:**
+- Route mapping: all `GET`/list/detail/dashboard → `require_role("viewer")`; scan start/cancel, alert ack/mute/unmute, target & channel CRUD, settings, `alerts/evaluate` → `require_role("operator")`; settings write and channel delete stay operator; audit read (Task 6) and future user admin → `require_role("admin")`.
+- Remove the old `require_auth`; keep `settings.api_key` semantics but only via the bearer path inside `require_role`.
+- Health (`/api/health`) and auth routes stay unauthenticated.
+
+- [ ] **Step 1: Failing tests** — `test_rbac.py`: viewer session can GET `/api/targets` (200) but POST `/api/targets` → 403; operator bearer token can POST (201/400); no creds → 401 on a protected GET. Use monkeypatched session helper or the callback flow to establish sessions.
+- [ ] **Step 2: Run, verify fail.**
+- [ ] **Step 3: Implement `require_role`, swap dependencies on all routes.**
+- [ ] **Step 4: Run `test_rbac.py` + full suite** (existing API tests must pass — they use the bearer token or an authenticated client; update `conftest.py` client to send a valid operator/admin session so existing tests keep working, and note the change in the report).
+- [ ] **Step 5: Commit** — `feat: role-based access control (viewer/operator/admin) on all API routes`
+
+---
+
+## Task 6: Audit with actor + audit API
+
+**Files:**
+- Modify: `backend/app/main.py` (`audit()` signature + all call sites), `backend/app/models.py` (`AuditLog.actor`), add migration `0004_audit_actor.py`
+- Test: `backend/tests/test_audit.py`
+
+**Interfaces:**
+- Produces:
+  - `AuditLog.actor: str` (default `""`), index on `created_at`.
+  - `audit(db, actor, action, entity, entity_id, detail="")` — `actor` now required (email from session or `"service-account"` for bearer, `"system"` for scheduler).
+  - `GET /api/audit` (admin) — paginated, filter by `actor`, `entity`, `action`, `since`. Returns `{total, items}`.
+  - Audit rows now also written for: scan start/cancel, alert ack/mute/unmute (previously unaudited).
+- Consumes: Task 5 (current-user for actor).
+
+**Details:**
+- Thread the acting user's email into handlers via a small dependency `auth.actor(request) -> str`. Add it where mutations occur.
+
+- [ ] **Step 1: Failing test** — POST a target as an operator session → a `GET /api/audit` (admin) shows a `target.create` row with `actor` == that user's email; a viewer gets 403 on `/api/audit`.
+- [ ] **Step 2: Run, verify fail.**
+- [ ] **Step 3: Add column + migration, change `audit()` signature and all call sites, add actor to alert/scan mutations, add `/api/audit`.**
+- [ ] **Step 4: Run `test_audit.py` + full suite.**
+- [ ] **Step 5: Commit** — `feat: actor-attributed audit log and admin audit API`
+
+---
+
+## Task 7: WorkQueue table + SKIP LOCKED claim
+
+**Files:**
+- Modify: `backend/app/models.py` (add `WorkQueue`), add migration `0005_work_queue.py`
+- Create: `backend/app/queue.py`, `backend/tests/test_queue.py`
+
+**Interfaces:**
+- Produces:
+  - `models.WorkQueue`: `id`, `kind str` (`"scan"` in Phase 0), `payload JSON`, `status str` (`queued|leased|done|failed`, default `queued`), `priority int` (default 0), `attempts int` (default 0), `max_attempts int` (default 3), `lease_expires_at datetime|None`, `last_error text`, `created_at`, `updated_at`. Index on `(status, priority, id)`.
+  - `queue.enqueue(db, kind, payload, priority=0) -> WorkQueue`.
+  - `queue.claim(db, lease_seconds=300) -> WorkQueue | None` — atomically selects one `queued` (or expired-lease `leased`) row ordered by `priority desc, id asc`, marks it `leased`, sets `lease_expires_at`, `attempts += 1`. On Postgres uses `.with_for_update(skip_locked=True)`; on SQLite falls back to a plain select inside the session transaction (single embedded worker — document the ceiling with a `ponytail:` comment).
+  - `queue.complete(db, item)` / `queue.fail(db, item, error)` — `fail` re-queues if `attempts < max_attempts` else marks `failed`.
+- Consumes: Task 1.
+
+- [ ] **Step 1: Failing tests** — `test_queue.py`: `enqueue` then `claim` returns the row and marks it `leased` with `attempts==1`; a second `claim` on an empty queue returns `None`; `fail` under `max_attempts` re-queues, at limit marks `failed`; `complete` marks `done`.
+- [ ] **Step 2: Run, verify fail.**
+- [ ] **Step 3: Implement model, migration, `queue.py` with dialect-aware claim.**
+- [ ] **Step 4: Run `test_queue.py` + full suite.**
+- [ ] **Step 5: Commit** — `feat: Postgres-backed work queue with SKIP LOCKED claim`
+
+---
+
+## Task 8: Worker process + enqueue refactor
+
+**Files:**
+- Create: `backend/app/worker.py`, `backend/tests/test_worker.py`
+- Modify: `backend/app/scheduler.py` (`enqueue_scan` writes a WorkQueue row), `backend/app/main.py` (embedded worker on startup), `backend/app/config.py` (`embedded_worker: bool`), `docker-compose.yml` (worker service)
+
+**Interfaces:**
+- Produces:
+  - `worker.process_one(db) -> bool` — claims one item; if `kind=="scan"` calls the existing `scan_engine.run_scan_job(payload["scan_job_id"])`; marks done/fail; returns True if it processed something.
+  - `worker.run_forever(poll_interval=2.0)` — loop calling `process_one`, sleeping when idle; installed as `python -m app.worker`.
+  - `scheduler.enqueue_scan(db, target, trigger)` — creates the `ScanJob` row (as today) then `queue.enqueue(db, "scan", {"scan_job_id": job.id})` **instead of** spawning a thread. Signature unchanged.
+  - `settings.embedded_worker: bool` (`CERTWATCH_EMBEDDED_WORKER`, default `True`). When True, `main.py` lifespan starts a background worker thread (dev/SQLite one-container mode). When False, rely on the external `worker` service.
+- Consumes: Task 7 (`queue`), existing `scan_engine.run_scan_job`.
+
+**Details:**
+- Keep `start_job_thread` removed from the enqueue path. The scheduler tick (`_tick`) still runs in the API process and calls the refactored `enqueue_scan`.
+- `docker-compose.yml`: add a `worker` service reusing the app image with `command: python -m app.worker` and `CERTWATCH_EMBEDDED_WORKER=false` on the API service in compose (so prod uses the dedicated worker).
+
+- [ ] **Step 1: Failing test** — `test_worker.py`: enqueue a scan job via `enqueue_scan` (monkeypatch `scan_engine.run_scan_job` to a stub that records the id), call `worker.process_one` → stub invoked with the right `scan_job_id`, queue row `done`. A failing stub (raises) → row `failed` after `max_attempts`.
+- [ ] **Step 2: Run, verify fail.**
+- [ ] **Step 3: Implement `worker.py`, refactor `enqueue_scan`, add embedded-worker startup + config, update compose.**
+- [ ] **Step 4: Run `test_worker.py` + full suite** (existing `test_scheduler.py` must still pass — the scheduler enqueues; if a scheduler test asserted thread behavior, update it to assert a queue row and note it in the report).
+- [ ] **Step 5: Commit** — `feat: split scan execution into a queue-driven worker process`
+
+---
+
+## Task 9: Metrics
+
+**Files:**
+- Create: `backend/app/metrics.py`, `backend/tests/test_metrics.py`
+- Modify: `backend/app/main.py`, `backend/requirements.txt` (add `prometheus-fastapi-instrumentator==7.0.0`)
+
+**Interfaces:**
+- Produces:
+  - `/metrics` endpoint (Prometheus text) — unauthenticated but bindable behind network policy (document).
+  - Custom collectors refreshed on scrape: `certwatch_queue_depth{status=}`, `certwatch_certs_expiring_days{window="7|30|90"}`, `certwatch_scan_jobs_total{status=}`, `certwatch_worker_last_heartbeat_seconds`. Plus default HTTP metrics from the instrumentator.
+- Consumes: Tasks 7 (queue depth), existing models.
+
+- [ ] **Step 1: Failing test** — `GET /metrics` returns 200 text containing `certwatch_queue_depth` and `certwatch_certs_expiring_days`.
+- [ ] **Step 2: Run, verify fail.**
+- [ ] **Step 3: Implement `metrics.py` (gauge functions querying the DB), instrument app in `main.py`.**
+- [ ] **Step 4: Run `test_metrics.py` + full suite.**
+- [ ] **Step 5: Commit** — `feat: Prometheus metrics endpoint`
+
+---
+
+## Task 10: Frontend auth (login + guard)
+
+**Files:**
+- Create: `frontend/src/pages/Login.tsx`, `frontend/src/auth.tsx`
+- Modify: `frontend/src/App.tsx`, `frontend/src/api.ts`
+
+**Interfaces:**
+- Produces:
+  - `api.ts`: fetch wrapper sends `credentials: "include"`; on 401 redirects to `/login`. `getMe()`, `logout()`.
+  - `auth.tsx`: `useAuth()` hook + `<RequireAuth>` wrapper reading `/api/auth/me`; a user chip (email + role + logout) in the app shell.
+  - `Login.tsx`: "Sign in with Microsoft" button → `window.location = "/api/auth/login"`; a collapsible break-glass form POSTing `/api/auth/local`.
+- Consumes: Tasks 4 (auth routes), 5 (401 semantics).
+
+**Details:**
+- Match the existing `ui.tsx`/`styles.css` design language and dark-mode support. No new UI library.
+
+- [ ] **Step 1:** Add `getMe`/`logout` + 401 redirect to `api.ts`.
+- [ ] **Step 2:** Build `Login.tsx` + `auth.tsx`, wrap routes in `App.tsx` with `<RequireAuth>`, add the user chip.
+- [ ] **Step 3: Build check** — `cd frontend && npm run build` succeeds.
+- [ ] **Step 4: Commit** — `feat: frontend login page and auth guard`
+
+(No unit test framework exists in the frontend; the production build is the gate, matching current repo practice. Do not introduce a test framework — YAGNI.)
+
+---
+
+## Self-Review Notes
+
+- **Spec coverage:** 0.1→Task1, 0.2→Tasks3-4, 0.3→Tasks5-6, 0.4→Task2, 0.5→Tasks7-8, 0.6→Task9, frontend login (0.2)→Task10. All Phase 0 sub-items covered.
+- **Type consistency:** `ROLE_RANK` (Task 3) used by `require_role` (Task 5) and `map_groups_to_role` (Task 4). `queue.enqueue/claim/complete/fail` (Task 7) consumed by `worker.process_one` (Task 8). `audit(db, actor, ...)` new signature (Task 6) — Task 6 updates ALL existing call sites.
+- **Ordering:** 1 (migrations) → 2 (secrets) → 3 (users) → 4 (auth) → 5 (rbac) → 6 (audit) → 7 (queue) → 8 (worker) → 9 (metrics) → 10 (frontend). Each depends only on earlier tasks.
+- **Migration numbering is linear:** 0001 baseline, 0002 channel secrets, 0003 users, 0004 audit actor, 0005 work queue. Each `down_revision` points at the prior.

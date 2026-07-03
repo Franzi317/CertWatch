@@ -7,19 +7,23 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import Session
+from starlette.middleware.sessions import SessionMiddleware
 
 from . import schemas, targets as target_lib
 from .alerts import dispatch_alerts, evaluate_alerts
+from .auth import require_role, router as auth_router
 from .config import settings
-from .db import get_db, init_db
+from .secrets import SecretsNotConfigured, encrypt as encrypt_secret, is_encrypted
+from .db import engine, get_db, init_db, run_migrations
 from .models import (
     AlertEvent,
     AuditLog,
@@ -32,10 +36,12 @@ from .models import (
     Target,
     utcnow,
 )
+from .metrics import setup_metrics
 from .notify import NotifyError, send_email, send_webhook
 from .scheduler import enqueue_scan, shutdown_scheduler, start_scheduler
 from .serialize import cert_dict, endpoint_dict, observation_dict
 from .status import days_until
+from . import worker as worker_lib
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("certwatch")
@@ -50,11 +56,40 @@ DEFAULT_SETTINGS = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
+    if engine.dialect.name == "sqlite":
+        # Dev/test: fast, and conftest/tests rely on create_all semantics.
+        init_db()
+    else:
+        # Prod (Postgres): schema changes go through versioned Alembic
+        # migrations, not create_all(). Handles both a fresh DB and a
+        # pre-Phase-0 DB that predates Alembic (see run_migrations()).
+        run_migrations()
+    if not os.environ.get("CERTWATCH_SESSION_SECRET") and settings.cookie_secure:
+        log.warning(
+            "CERTWATCH_SESSION_SECRET is not set; sessions are using an ephemeral "
+            "per-process secret and will not survive a restart or work across "
+            "multiple replicas. Set CERTWATCH_SESSION_SECRET in production."
+        )
     _seed_settings()
     if settings.enable_scheduler:
         start_scheduler()
+    worker_stop_event = None
+    worker_thread = None
+    if settings.embedded_worker:
+        # One-container dev/SQLite quickstart: drain the queue in-process
+        # instead of requiring the dedicated `worker` service (see
+        # docker-compose.yml, CERTWATCH_EMBEDDED_WORKER=false in prod).
+        worker_stop_event = threading.Event()
+        worker_thread = threading.Thread(
+            target=worker_lib.run_forever,
+            kwargs={"stop_event": worker_stop_event},
+            daemon=True,
+        )
+        worker_thread.start()
+        log.info("embedded worker thread started")
     yield
+    if worker_stop_event is not None:
+        worker_stop_event.set()
     shutdown_scheduler()
 
 
@@ -66,6 +101,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.session_secret,
+    https_only=settings.cookie_secure,
+    same_site="lax",
+)
+app.include_router(auth_router)
+
+# GET /metrics: Prometheus text exposition (default HTTP metrics + CertWatch
+# gauges from app/metrics.py). Deliberately unauthenticated -- restrict access
+# at the network layer (firewall/reverse-proxy allowlist) in production.
+setup_metrics(app)
 
 
 def _seed_settings() -> None:
@@ -80,17 +127,8 @@ def _seed_settings() -> None:
         db.close()
 
 
-def require_auth(authorization: str = Header(default="")) -> None:
-    """Optional bearer-token guard. Open when CERTWATCH_API_KEY is unset."""
-    if not settings.api_key:
-        return
-    token = authorization.removeprefix("Bearer ").strip()
-    if token != settings.api_key:
-        raise HTTPException(status_code=401, detail="invalid or missing API key")
-
-
-def audit(db: Session, action: str, entity: str, entity_id, detail: str = "") -> None:
-    db.add(AuditLog(action=action, entity=entity, entity_id=str(entity_id), detail=detail))
+def audit(db: Session, actor: str, action: str, entity: str, entity_id, detail: str = "") -> None:
+    db.add(AuditLog(actor=actor, action=action, entity=entity, entity_id=str(entity_id), detail=detail))
 
 
 # --------------------------------------------------------------------------- #
@@ -111,12 +149,12 @@ def _target_out(db: Session, t: Target) -> dict:
     return out
 
 
-@app.get("/api/targets", dependencies=[Depends(require_auth)])
+@app.get("/api/targets", dependencies=[Depends(require_role("viewer"))])
 def list_targets(db: Session = Depends(get_db)):
     return [_target_out(db, t) for t in db.scalars(select(Target).order_by(Target.name)).all()]
 
 
-@app.post("/api/targets/validate", dependencies=[Depends(require_auth)])
+@app.post("/api/targets/validate", dependencies=[Depends(require_role("viewer"))])
 def validate_target(body: schemas.TargetIn):
     try:
         count = target_lib.validate(body.target_type, body.value, settings.max_cidr_hosts)
@@ -132,8 +170,12 @@ def validate_target(body: schemas.TargetIn):
     }
 
 
-@app.post("/api/targets", dependencies=[Depends(require_auth)], status_code=201)
-def create_target(body: schemas.TargetIn, db: Session = Depends(get_db)):
+@app.post("/api/targets", status_code=201)
+def create_target(
+    body: schemas.TargetIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     try:
         target_lib.validate(body.target_type, body.value, settings.max_cidr_hosts)
         ports = target_lib.normalize_ports(body.ports, settings.default_ports)
@@ -144,12 +186,12 @@ def create_target(body: schemas.TargetIn, db: Session = Depends(get_db)):
     t = Target(**data)
     db.add(t)
     db.flush()
-    audit(db, "target.create", "target", t.id, t.name)
+    audit(db, principal["email"], "target.create", "target", t.id, t.name)
     db.commit()
     return _target_out(db, t)
 
 
-@app.get("/api/targets/{target_id}", dependencies=[Depends(require_auth)])
+@app.get("/api/targets/{target_id}", dependencies=[Depends(require_role("viewer"))])
 def get_target(target_id: int, db: Session = Depends(get_db)):
     t = db.get(Target, target_id)
     if not t:
@@ -157,8 +199,13 @@ def get_target(target_id: int, db: Session = Depends(get_db)):
     return _target_out(db, t)
 
 
-@app.put("/api/targets/{target_id}", dependencies=[Depends(require_auth)])
-def update_target(target_id: int, body: schemas.TargetIn, db: Session = Depends(get_db)):
+@app.put("/api/targets/{target_id}")
+def update_target(
+    target_id: int,
+    body: schemas.TargetIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     t = db.get(Target, target_id)
     if not t:
         raise HTTPException(404, "target not found")
@@ -170,17 +217,21 @@ def update_target(target_id: int, body: schemas.TargetIn, db: Session = Depends(
     for k, v in body.model_dump().items():
         setattr(t, k, v)
     t.ports = ports
-    audit(db, "target.update", "target", t.id, t.name)
+    audit(db, principal["email"], "target.update", "target", t.id, t.name)
     db.commit()
     return _target_out(db, t)
 
 
-@app.delete("/api/targets/{target_id}", dependencies=[Depends(require_auth)], status_code=204)
-def delete_target(target_id: int, db: Session = Depends(get_db)):
+@app.delete("/api/targets/{target_id}", status_code=204)
+def delete_target(
+    target_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     t = db.get(Target, target_id)
     if not t:
         raise HTTPException(404, "target not found")
-    audit(db, "target.delete", "target", t.id, t.name)
+    audit(db, principal["email"], "target.delete", "target", t.id, t.name)
     db.delete(t)
     db.commit()
 
@@ -188,33 +239,44 @@ def delete_target(target_id: int, db: Session = Depends(get_db)):
 # --------------------------------------------------------------------------- #
 # Scan jobs
 # --------------------------------------------------------------------------- #
-@app.post("/api/targets/{target_id}/scan", dependencies=[Depends(require_auth)], status_code=202)
-def start_scan(target_id: int, db: Session = Depends(get_db)):
+@app.post("/api/targets/{target_id}/scan", status_code=202)
+def start_scan(
+    target_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     t = db.get(Target, target_id)
     if not t:
         raise HTTPException(404, "target not found")
     job = enqueue_scan(db, t, trigger="manual")
+    audit(db, principal["email"], "scan.start", "scan_job", job.id, t.name)
+    db.commit()
     return schemas.ScanJobOut.model_validate(job).model_dump()
 
 
-@app.post("/api/scans/{job_id}/cancel", dependencies=[Depends(require_auth)])
-def cancel_scan(job_id: int, db: Session = Depends(get_db)):
+@app.post("/api/scans/{job_id}/cancel")
+def cancel_scan(
+    job_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     job = db.get(ScanJob, job_id)
     if not job:
         raise HTTPException(404, "scan job not found")
     if job.status in ("pending", "running"):
         job.cancel_requested = True
+        audit(db, principal["email"], "scan.cancel", "scan_job", job.id)
         db.commit()
     return schemas.ScanJobOut.model_validate(job).model_dump()
 
 
-@app.get("/api/scans", dependencies=[Depends(require_auth)])
+@app.get("/api/scans", dependencies=[Depends(require_role("viewer"))])
 def list_scans(limit: int = Query(50, le=500), db: Session = Depends(get_db)):
     jobs = db.scalars(select(ScanJob).order_by(ScanJob.id.desc()).limit(limit)).all()
     return [schemas.ScanJobOut.model_validate(j).model_dump() for j in jobs]
 
 
-@app.get("/api/scans/{job_id}", dependencies=[Depends(require_auth)])
+@app.get("/api/scans/{job_id}", dependencies=[Depends(require_role("viewer"))])
 def get_scan(job_id: int, db: Session = Depends(get_db)):
     job = db.get(ScanJob, job_id)
     if not job:
@@ -225,7 +287,7 @@ def get_scan(job_id: int, db: Session = Depends(get_db)):
 # --------------------------------------------------------------------------- #
 # Certificates (deduplicated by fingerprint)
 # --------------------------------------------------------------------------- #
-@app.get("/api/certificates", dependencies=[Depends(require_auth)])
+@app.get("/api/certificates", dependencies=[Depends(require_role("viewer"))])
 def list_certificates(
     q: str = "",
     expiring_within: int | None = None,
@@ -271,7 +333,7 @@ def list_certificates(
     return {"total": total, "items": [cert_dict(db, c) for c in rows]}
 
 
-@app.get("/api/certificates/{cert_id}", dependencies=[Depends(require_auth)])
+@app.get("/api/certificates/{cert_id}", dependencies=[Depends(require_role("viewer"))])
 def get_certificate(cert_id: int, db: Session = Depends(get_db)):
     c = db.get(Certificate, cert_id)
     if not c:
@@ -290,7 +352,7 @@ def get_certificate(cert_id: int, db: Session = Depends(get_db)):
 # --------------------------------------------------------------------------- #
 # Endpoints
 # --------------------------------------------------------------------------- #
-@app.get("/api/endpoints", dependencies=[Depends(require_auth)])
+@app.get("/api/endpoints", dependencies=[Depends(require_role("viewer"))])
 def list_endpoints(
     q: str = "",
     status: str = "",
@@ -328,7 +390,7 @@ def list_endpoints(
     return {"total": total, "items": [endpoint_dict(db, e, with_cert=False) for e in rows]}
 
 
-@app.get("/api/endpoints/{endpoint_id}", dependencies=[Depends(require_auth)])
+@app.get("/api/endpoints/{endpoint_id}", dependencies=[Depends(require_role("viewer"))])
 def get_endpoint(endpoint_id: int, db: Session = Depends(get_db)):
     ep = db.get(Endpoint, endpoint_id)
     if not ep:
@@ -369,7 +431,7 @@ def _alert_dict(db: Session, ev: AlertEvent) -> dict:
     }
 
 
-@app.get("/api/alerts", dependencies=[Depends(require_auth)])
+@app.get("/api/alerts", dependencies=[Depends(require_role("viewer"))])
 def list_alerts(include_resolved: bool = False, db: Session = Depends(get_db)):
     stmt = select(AlertEvent).order_by(AlertEvent.updated_at.desc())
     if not include_resolved:
@@ -377,39 +439,55 @@ def list_alerts(include_resolved: bool = False, db: Session = Depends(get_db)):
     return [_alert_dict(db, e) for e in db.scalars(stmt).all()]
 
 
-@app.post("/api/alerts/{alert_id}/ack", dependencies=[Depends(require_auth)])
-def ack_alert(alert_id: int, db: Session = Depends(get_db)):
+@app.post("/api/alerts/{alert_id}/ack")
+def ack_alert(
+    alert_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     ev = db.get(AlertEvent, alert_id)
     if not ev:
         raise HTTPException(404, "alert not found")
     ev.acknowledged = True
+    audit(db, principal["email"], "alert.ack", "alert_event", ev.id)
     db.commit()
     return _alert_dict(db, ev)
 
 
-@app.post("/api/alerts/{alert_id}/mute", dependencies=[Depends(require_auth)])
-def mute_alert(alert_id: int, body: schemas.AlertActionIn, db: Session = Depends(get_db)):
+@app.post("/api/alerts/{alert_id}/mute")
+def mute_alert(
+    alert_id: int,
+    body: schemas.AlertActionIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     ev = db.get(AlertEvent, alert_id)
     if not ev:
         raise HTTPException(404, "alert not found")
     ev.muted = True
     ev.muted_until = utcnow() + timedelta(hours=body.mute_hours) if body.mute_hours else None
+    audit(db, principal["email"], "alert.mute", "alert_event", ev.id)
     db.commit()
     return _alert_dict(db, ev)
 
 
-@app.post("/api/alerts/{alert_id}/unmute", dependencies=[Depends(require_auth)])
-def unmute_alert(alert_id: int, db: Session = Depends(get_db)):
+@app.post("/api/alerts/{alert_id}/unmute")
+def unmute_alert(
+    alert_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     ev = db.get(AlertEvent, alert_id)
     if not ev:
         raise HTTPException(404, "alert not found")
     ev.muted = False
     ev.muted_until = None
+    audit(db, principal["email"], "alert.unmute", "alert_event", ev.id)
     db.commit()
     return _alert_dict(db, ev)
 
 
-@app.post("/api/alerts/evaluate", dependencies=[Depends(require_auth)])
+@app.post("/api/alerts/evaluate", dependencies=[Depends(require_role("operator"))])
 def evaluate(db: Session = Depends(get_db)):
     return evaluate_alerts(db)
 
@@ -418,6 +496,20 @@ def evaluate(db: Session = Depends(get_db)):
 # Notification channels
 # --------------------------------------------------------------------------- #
 _SECRET_KEYS = {"password", "url"}
+
+
+def _encrypt_secrets(config: dict) -> dict:
+    """Encrypt secret-shaped values (password, url) that aren't already encrypted.
+
+    Raises SecretsNotConfigured (via app.secrets.encrypt) if CERTWATCH_MASTER_KEY
+    isn't set and a plaintext secret needs encrypting.
+    """
+    out = dict(config or {})
+    for k in _SECRET_KEYS:
+        v = out.get(k)
+        if v and not is_encrypted(v):
+            out[k] = encrypt_secret(v)
+    return out
 
 
 def _channel_out(ch: NotificationChannel) -> dict:
@@ -432,23 +524,37 @@ def _channel_out(ch: NotificationChannel) -> dict:
     }
 
 
-@app.get("/api/channels", dependencies=[Depends(require_auth)])
+@app.get("/api/channels", dependencies=[Depends(require_role("viewer"))])
 def list_channels(db: Session = Depends(get_db)):
     return [_channel_out(c) for c in db.scalars(select(NotificationChannel)).all()]
 
 
-@app.post("/api/channels", dependencies=[Depends(require_auth)], status_code=201)
-def create_channel(body: schemas.ChannelIn, db: Session = Depends(get_db)):
-    ch = NotificationChannel(**body.model_dump())
+@app.post("/api/channels", status_code=201)
+def create_channel(
+    body: schemas.ChannelIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    data = body.model_dump()
+    try:
+        data["config"] = _encrypt_secrets(data.get("config") or {})
+    except SecretsNotConfigured as e:
+        raise HTTPException(400, str(e))
+    ch = NotificationChannel(**data)
     db.add(ch)
     db.flush()
-    audit(db, "channel.create", "channel", ch.id, ch.name)
+    audit(db, principal["email"], "channel.create", "channel", ch.id, ch.name)
     db.commit()
     return _channel_out(ch)
 
 
-@app.put("/api/channels/{channel_id}", dependencies=[Depends(require_auth)])
-def update_channel(channel_id: int, body: schemas.ChannelIn, db: Session = Depends(get_db)):
+@app.put("/api/channels/{channel_id}")
+def update_channel(
+    channel_id: int,
+    body: schemas.ChannelIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     ch = db.get(NotificationChannel, channel_id)
     if not ch:
         raise HTTPException(404, "channel not found")
@@ -458,25 +564,33 @@ def update_channel(channel_id: int, body: schemas.ChannelIn, db: Session = Depen
         if k in _SECRET_KEYS and v == "":
             continue  # keep existing secret
         new_config[k] = v
+    try:
+        new_config = _encrypt_secrets(new_config)
+    except SecretsNotConfigured as e:
+        raise HTTPException(400, str(e))
     ch.name, ch.channel_type, ch.enabled, ch.re_alert_hours = (
         body.name, body.channel_type, body.enabled, body.re_alert_hours)
     ch.config = new_config
-    audit(db, "channel.update", "channel", ch.id, ch.name)
+    audit(db, principal["email"], "channel.update", "channel", ch.id, ch.name)
     db.commit()
     return _channel_out(ch)
 
 
-@app.delete("/api/channels/{channel_id}", dependencies=[Depends(require_auth)], status_code=204)
-def delete_channel(channel_id: int, db: Session = Depends(get_db)):
+@app.delete("/api/channels/{channel_id}", status_code=204)
+def delete_channel(
+    channel_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     ch = db.get(NotificationChannel, channel_id)
     if not ch:
         raise HTTPException(404, "channel not found")
-    audit(db, "channel.delete", "channel", ch.id, ch.name)
+    audit(db, principal["email"], "channel.delete", "channel", ch.id, ch.name)
     db.delete(ch)
     db.commit()
 
 
-@app.post("/api/channels/{channel_id}/test", dependencies=[Depends(require_auth)])
+@app.post("/api/channels/{channel_id}/test", dependencies=[Depends(require_role("operator"))])
 def test_channel(channel_id: int, db: Session = Depends(get_db)):
     ch = db.get(NotificationChannel, channel_id)
     if not ch:
@@ -502,29 +616,74 @@ def _base_url(db: Session) -> str:
     return row.value.get("value") if row else "http://localhost:5173"
 
 
-@app.get("/api/settings", dependencies=[Depends(require_auth)])
+@app.get("/api/settings", dependencies=[Depends(require_role("viewer"))])
 def get_settings(db: Session = Depends(get_db)):
     rows = db.scalars(select(SystemSetting)).all()
     return {r.key: r.value.get("value") for r in rows}
 
 
-@app.put("/api/settings", dependencies=[Depends(require_auth)])
-def update_settings(body: dict, db: Session = Depends(get_db)):
+@app.put("/api/settings")
+def update_settings(
+    body: dict,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
     for key, value in body.items():
         row = db.get(SystemSetting, key)
         if row is None:
             db.add(SystemSetting(key=key, value={"value": value}))
         else:
             row.value = {"value": value}
-    audit(db, "settings.update", "settings", "-", ",".join(body.keys()))
+    audit(db, principal["email"], "settings.update", "settings", "-", ",".join(body.keys()))
     db.commit()
     return get_settings(db)
 
 
 # --------------------------------------------------------------------------- #
+# Audit log (admin only)
+# --------------------------------------------------------------------------- #
+def _audit_dict(row: AuditLog) -> dict:
+    return {
+        "id": row.id,
+        "actor": row.actor,
+        "action": row.action,
+        "entity": row.entity,
+        "entity_id": row.entity_id,
+        "detail": row.detail,
+        "created_at": row.created_at,
+    }
+
+
+@app.get("/api/audit", dependencies=[Depends(require_role("admin"))])
+def list_audit(
+    limit: int = Query(100, le=1000),
+    offset: int = Query(0, ge=0),
+    actor: str | None = None,
+    entity: str | None = None,
+    action: str | None = None,
+    since: datetime | None = None,
+    db: Session = Depends(get_db),
+):
+    stmt = select(AuditLog)
+    if actor:
+        stmt = stmt.where(AuditLog.actor == actor)
+    if entity:
+        stmt = stmt.where(AuditLog.entity == entity)
+    if action:
+        stmt = stmt.where(AuditLog.action == action)
+    if since:
+        stmt = stmt.where(AuditLog.created_at >= since)
+    total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows = db.scalars(
+        stmt.order_by(AuditLog.created_at.desc()).limit(limit).offset(offset)
+    ).all()
+    return {"total": total, "items": [_audit_dict(r) for r in rows]}
+
+
+# --------------------------------------------------------------------------- #
 # Dashboard
 # --------------------------------------------------------------------------- #
-@app.get("/api/dashboard", dependencies=[Depends(require_auth)])
+@app.get("/api/dashboard", dependencies=[Depends(require_role("viewer"))])
 def dashboard(db: Session = Depends(get_db)):
     now = utcnow()
     total_certs = db.scalar(select(func.count(Certificate.id))) or 0

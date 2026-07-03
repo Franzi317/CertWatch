@@ -1,11 +1,23 @@
-import time
-
 import pytest
 
-from app import scan_engine
+from app import scan_engine, worker
+from app.db import SessionLocal
 from app.scanner import ScanResult
+from conftest import login_as
 
 TARGET = {"name": "Lab box", "target_type": "ip", "value": "10.0.0.5", "ports": [443, 8443]}
+
+
+# These tests predate RBAC (Phase 0, Task 5) and exercise every route as an
+# open API. Rather than rewrite each test to establish its own session, this
+# overrides the module-scoped `client` fixture (same name, referencing the
+# parent fixture from conftest.py) to log in as admin — admin outranks every
+# role, so all previously-open calls stay authorized without touching the
+# test bodies below.
+@pytest.fixture
+def client(client, monkeypatch):
+    login_as(client, "admin", monkeypatch)
+    return client
 
 
 def _fake_cert(fp="AB:CD"):
@@ -61,11 +73,15 @@ def test_scan_job_creation_and_dedup(client, monkeypatch):
     assert r.status_code == 202
     jid = r.json()["id"]
 
-    for _ in range(50):
-        job = client.get(f"/api/scans/{jid}").json()
-        if job["status"] in ("completed", "failed", "cancelled"):
-            break
-        time.sleep(0.1)
+    # No embedded worker runs during tests (CERTWATCH_EMBEDDED_WORKER=false,
+    # see conftest.py) -- drain the queue item explicitly and deterministically.
+    wdb = SessionLocal()
+    try:
+        assert worker.process_one(wdb) is True
+    finally:
+        wdb.close()
+
+    job = client.get(f"/api/scans/{jid}").json()
     assert job["status"] == "completed"
     assert job["total_endpoints"] == 2          # two ports
     assert job["certs_found"] == 2
@@ -94,6 +110,42 @@ def test_channel_secrets_are_scrubbed(client):
     })
     # nothing crashes; host updated
     assert client.get("/api/channels").json()[0]["config_summary"]["host"] == "smtp2.example.com"
+
+
+def test_channel_secrets_stored_encrypted(client):
+    from app import secrets as app_secrets
+    from app.db import SessionLocal
+    from app.models import NotificationChannel
+
+    plaintext_password = "s3cret"
+    plaintext_url = "https://hooks.example.com/services/T00/B00/XXXX"
+    r = client.post("/api/channels", json={
+        "name": "hook", "channel_type": "webhook",
+        "config": {"url": plaintext_url, "password": plaintext_password, "recipients": ["a@b.c"]},
+    })
+    assert r.status_code == 201
+    cid = r.json()["id"]
+
+    # Bypass the API and read the persisted row directly, so a regression
+    # that drops the encrypt() call (but leaves config_summary scrubbing
+    # intact) would still be caught.
+    session = SessionLocal()
+    try:
+        row = session.get(NotificationChannel, cid)
+        stored_password = row.config["password"]
+        stored_url = row.config["url"]
+    finally:
+        session.close()
+
+    assert app_secrets.is_encrypted(stored_password)
+    assert stored_password != plaintext_password
+
+    assert app_secrets.is_encrypted(stored_url)
+    assert stored_url != plaintext_url
+
+    # and the ciphertext round-trips back to the original plaintext
+    assert app_secrets.decrypt(stored_password) == plaintext_password
+    assert app_secrets.decrypt(stored_url) == plaintext_url
 
 
 def test_dashboard_summary(client):

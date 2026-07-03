@@ -19,8 +19,22 @@ services:
       - .env
     environment:
       CERTWATCH_DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-certwatch}:${POSTGRES_PASSWORD:-certwatch}@db:5432/${POSTGRES_DB:-certwatch}
+      # Scans are executed by the dedicated `worker` service, not in-process.
+      CERTWATCH_EMBEDDED_WORKER: "false"
+      CERTWATCH_ENABLE_SCHEDULER: "true"
     ports:
       - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: python -m app.worker
+    env_file:
+      - .env
+    environment:
+      CERTWATCH_DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-certwatch}:${POSTGRES_PASSWORD:-certwatch}@db:5432/${POSTGRES_DB:-certwatch}
     depends_on:
       db:
         condition: service_healthy

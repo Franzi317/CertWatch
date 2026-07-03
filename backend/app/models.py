@@ -18,6 +18,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -198,10 +199,53 @@ class SystemSetting(Base):
     value: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
-class AuditLog(Base):
-    __tablename__ = "audit_logs"
+ROLE_RANK = {"viewer": 0, "operator": 1, "admin": 2}
+
+
+class User(Base):
+    __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(255), default="")
+    # role: viewer | operator | admin (validated in the app layer, not the DB)
+    role: Mapped[str] = mapped_column(String(16), default="viewer")
+    # source: entra | local
+    source: Mapped[str] = mapped_column(String(16), default="entra")
+    disabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class WorkQueue(Base):
+    """Durable, Postgres-backed work queue. Workers claim rows with
+    `queue.claim()` (SKIP LOCKED on Postgres), process the payload, then call
+    `queue.complete()`/`queue.fail()`. Replaces in-process scan threads
+    (wiring happens in a later task)."""
+
+    __tablename__ = "work_queue"
+    __table_args__ = (Index("ix_work_queue_status_priority_id", "status", "priority", "id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32))  # "scan" in Phase 0
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    # status: queued | leased | done | failed
+    status: Mapped[str] = mapped_column(String(16), default="queued")
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    __table_args__ = (Index("ix_audit_logs_created_at", "created_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    actor: Mapped[str] = mapped_column(String(255), default="")  # acting user's email, "service-account", or "system"
     action: Mapped[str] = mapped_column(String(64))     # target.create, channel.update, ...
     entity: Mapped[str] = mapped_column(String(64))
     entity_id: Mapped[str] = mapped_column(String(64), default="")

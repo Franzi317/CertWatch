@@ -12,6 +12,8 @@ import ssl
 import urllib.request
 from email.message import EmailMessage
 
+from .secrets import decrypt
+
 log = logging.getLogger("certwatch.notify")
 
 
@@ -48,7 +50,7 @@ def send_email(config: dict, subject: str, body_text: str, body_html: str | None
             if config.get("use_starttls") and not config.get("use_tls"):
                 server.starttls(context=context)
             if config.get("username"):
-                server.login(config["username"], config.get("password", ""))
+                server.login(config["username"], decrypt(config.get("password", "")))
             server.send_message(msg)
     except (smtplib.SMTPException, OSError) as e:
         raise NotifyError(f"SMTP send failed: {e}") from e
@@ -59,7 +61,7 @@ def send_webhook(config: dict, title: str, text: str, facts: dict | None = None,
 
     config keys: url, format ('teams' | 'generic'). For 'generic' we POST a flat
     JSON object {title, text, facts, link}."""
-    url = config.get("url")
+    url = decrypt(config.get("url") or "")
     if not url:
         raise NotifyError("webhook URL not configured")
 
