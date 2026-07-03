@@ -198,6 +198,24 @@ class SystemSetting(Base):
     value: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+ROLE_RANK = {"viewer": 0, "operator": 1, "admin": 2}
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(255), default="")
+    # role: viewer | operator | admin (validated in the app layer, not the DB)
+    role: Mapped[str] = mapped_column(String(16), default="viewer")
+    # source: entra | local
+    source: Mapped[str] = mapped_column(String(16), default="entra")
+    disabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 

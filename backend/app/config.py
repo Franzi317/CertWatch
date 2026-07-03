@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     # Empty = secret writes are refused (see app.secrets.SecretsNotConfigured).
     master_key: str = ""
 
+    # Break-glass local admin (Phase 0, used by Task 4's login flow). Empty
+    # admin_email disables the break-glass path entirely. admin_password_hash
+    # is a bcrypt hash string, never a plaintext password.
+    admin_email: str = ""
+    admin_password_hash: str = ""
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
