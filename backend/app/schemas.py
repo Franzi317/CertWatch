@@ -3,6 +3,7 @@ secrets (SMTP password, webhook URL) so they're never exposed via the API."""
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -76,7 +77,7 @@ class TestNotifyIn(BaseModel):
 
 class IssuerIn(BaseModel):
     name: str
-    issuer_type: str  # adcs | acme
+    issuer_type: Literal["adcs", "acme"]
     enabled: bool = True
     config: dict = Field(default_factory=dict)
 

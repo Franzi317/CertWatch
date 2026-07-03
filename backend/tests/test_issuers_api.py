@@ -203,3 +203,32 @@ def test_acme_issuer_account_key_never_returned(client, monkeypatch, db):
 def test_no_credentials_401(client):
     r = client.get("/api/issuers")
     assert r.status_code == 401
+
+
+def test_create_with_bogus_issuer_type_rejected_and_no_secret_leak(client, monkeypatch):
+    login_as(client, "admin", monkeypatch)
+
+    for bad_type in ("ADCS", "bogus"):
+        bad_issuer = {
+            "name": "sneaky-ca",
+            "issuer_type": bad_type,
+            "enabled": True,
+            "config": {"password": "hunter2"},
+        }
+        r = client.post("/api/issuers", json=bad_issuer)
+        assert r.status_code in (400, 422), r.text
+        assert r.status_code != 200
+        assert "hunter2" not in r.text
+
+
+def test_update_cannot_change_issuer_type(client, monkeypatch):
+    login_as(client, "admin", monkeypatch)
+    r = client.post("/api/issuers", json=ADCS_ISSUER)
+    issuer_id = r.json()["id"]
+
+    update_body = dict(ADCS_ISSUER)
+    update_body["issuer_type"] = "acme"
+
+    r = client.put(f"/api/issuers/{issuer_id}", json=update_body)
+    assert r.status_code == 400
+    assert "cannot change issuer type" in r.json()["detail"]

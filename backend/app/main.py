@@ -666,6 +666,8 @@ def create_issuer(
     principal: dict = Depends(require_role("admin")),
 ):
     data = body.model_dump()
+    if data["issuer_type"] not in _ISSUER_SECRET_KEYS:
+        raise HTTPException(400, "unknown issuer type")
     try:
         data["config"] = _encrypt_issuer_secrets(data["issuer_type"], data.get("config") or {})
     except SecretsNotConfigured as e:
@@ -688,6 +690,10 @@ def update_issuer(
     issuer = db.get(Issuer, issuer_id)
     if not issuer:
         raise HTTPException(404, "issuer not found")
+    if body.issuer_type != issuer.issuer_type:
+        raise HTTPException(400, "cannot change issuer type")
+    if body.issuer_type not in _ISSUER_SECRET_KEYS:
+        raise HTTPException(400, "unknown issuer type")
     secret_keys = _ISSUER_SECRET_KEYS.get(body.issuer_type, set())
     # Merge config so a blank secret field doesn't wipe an existing one.
     new_config = dict(issuer.config or {})
@@ -699,7 +705,7 @@ def update_issuer(
         new_config = _encrypt_issuer_secrets(body.issuer_type, new_config)
     except SecretsNotConfigured as e:
         raise HTTPException(400, str(e))
-    issuer.name, issuer.issuer_type, issuer.enabled = body.name, body.issuer_type, body.enabled
+    issuer.name, issuer.enabled = body.name, body.enabled
     issuer.config = new_config
     audit(db, principal["email"], "issuer.update", "issuer", issuer.id, issuer.name)
     db.commit()
