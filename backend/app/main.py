@@ -23,7 +23,7 @@ from .alerts import dispatch_alerts, evaluate_alerts
 from .auth import require_role, router as auth_router
 from .config import settings
 from .secrets import SecretsNotConfigured, encrypt as encrypt_secret, is_encrypted
-from .db import get_db, init_db
+from .db import engine, get_db, init_db, run_migrations
 from .models import (
     AlertEvent,
     AuditLog,
@@ -56,7 +56,20 @@ DEFAULT_SETTINGS = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
+    if engine.dialect.name == "sqlite":
+        # Dev/test: fast, and conftest/tests rely on create_all semantics.
+        init_db()
+    else:
+        # Prod (Postgres): schema changes go through versioned Alembic
+        # migrations, not create_all(). Handles both a fresh DB and a
+        # pre-Phase-0 DB that predates Alembic (see run_migrations()).
+        run_migrations()
+    if not os.environ.get("CERTWATCH_SESSION_SECRET") and settings.cookie_secure:
+        log.warning(
+            "CERTWATCH_SESSION_SECRET is not set; sessions are using an ephemeral "
+            "per-process secret and will not survive a restart or work across "
+            "multiple replicas. Set CERTWATCH_SESSION_SECRET in production."
+        )
     _seed_settings()
     if settings.enable_scheduler:
         start_scheduler()
