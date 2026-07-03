@@ -2,15 +2,22 @@
 const BASE = (import.meta.env.VITE_API_BASE as string) || "/api";
 const KEY = (import.meta.env.VITE_API_KEY as string) || "";
 
+// Endpoints that legitimately return 401 as part of the auth flow itself.
+// Redirecting to /login on their failure would cause a redirect loop.
+const AUTH_CHECK_PATHS = ["/auth/me", "/auth/local"];
+
 async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
   const headers: Record<string, string> = { "Content-Type": "application/json", ...(opts.headers as any) };
   if (KEY) headers["Authorization"] = `Bearer ${KEY}`;
-  const res = await fetch(`${BASE}${path}`, { ...opts, headers });
+  const res = await fetch(`${BASE}${path}`, { ...opts, headers, credentials: "include" });
   if (!res.ok) {
     let detail = res.statusText;
     try {
       detail = (await res.json()).detail || detail;
     } catch {}
+    if (res.status === 401 && !AUTH_CHECK_PATHS.some((p) => path.startsWith(p))) {
+      window.location.assign("/login");
+    }
     throw new Error(detail);
   }
   if (res.status === 204) return undefined as T;
@@ -23,6 +30,21 @@ export const api = {
   put: <T>(p: string, body: any) => req<T>(p, { method: "PUT", body: JSON.stringify(body) }),
   del: (p: string) => req<void>(p, { method: "DELETE" }),
 };
+
+// ---- Auth ----
+export interface Me { id: number; email: string; role: string; }
+
+export function getMe(): Promise<Me> {
+  return req<Me>("/auth/me");
+}
+
+export function loginLocal(email: string, password: string): Promise<Me> {
+  return req<Me>("/auth/local", { method: "POST", body: JSON.stringify({ email, password }) });
+}
+
+export async function logout(): Promise<void> {
+  await req<void>("/auth/logout", { method: "POST" });
+}
 
 // ---- Types ----
 export interface Target {

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { NavLink, Route, Routes } from "react-router-dom";
+import { NavLink, Route, Routes, useNavigate } from "react-router-dom";
 import Dashboard from "./pages/Dashboard";
 import Targets from "./pages/Targets";
 import Certificates from "./pages/Certificates";
@@ -9,6 +9,9 @@ import EndpointDetail from "./pages/EndpointDetail";
 import ScanJobs from "./pages/ScanJobs";
 import Alerts from "./pages/Alerts";
 import Settings from "./pages/Settings";
+import Login from "./pages/Login";
+import { AuthProvider, RequireAuth, useAuth } from "./auth";
+import { logout } from "./api";
 
 const nav = [
   ["/", "Dashboard"],
@@ -20,7 +23,31 @@ const nav = [
   ["/settings", "Settings"],
 ];
 
-export default function App() {
+function UserChip() {
+  const { user } = useAuth();
+  const navigate = useNavigate();
+  if (!user) return null;
+
+  async function handleLogout() {
+    try {
+      await logout();
+    } finally {
+      navigate("/login", { replace: true });
+    }
+  }
+
+  return (
+    <div className="user-chip">
+      <div className="user-chip-info">
+        <div className="user-chip-email">{user.email}</div>
+        <div className="user-chip-role">{user.role}</div>
+      </div>
+      <button className="theme-toggle" onClick={handleLogout}>Log out</button>
+    </div>
+  );
+}
+
+function AppShell() {
   const [theme, setTheme] = useState(
     () => localStorage.getItem("theme")
       || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"),
@@ -43,6 +70,7 @@ export default function App() {
           ))}
         </nav>
         <div className="sidebar-foot">
+          <UserChip />
           <button className="theme-toggle" onClick={() => setShowHelp((v) => !v)}>Help</button>
           {showHelp && <div className="notice">Need assistance? Contact Ryan Franzman.</div>}
           <button className="theme-toggle" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
@@ -68,5 +96,23 @@ export default function App() {
         </Routes>
       </main>
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <Routes>
+        <Route path="/login" element={<Login />} />
+        <Route
+          path="/*"
+          element={
+            <RequireAuth>
+              <AppShell />
+            </RequireAuth>
+          }
+        />
+      </Routes>
+    </AuthProvider>
   );
 }
