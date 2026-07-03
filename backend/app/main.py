@@ -36,6 +36,7 @@ from .models import (
     Target,
     utcnow,
 )
+from .metrics import setup_metrics
 from .notify import NotifyError, send_email, send_webhook
 from .scheduler import enqueue_scan, shutdown_scheduler, start_scheduler
 from .serialize import cert_dict, endpoint_dict, observation_dict
@@ -94,6 +95,11 @@ app.add_middleware(
     same_site="lax",
 )
 app.include_router(auth_router)
+
+# GET /metrics: Prometheus text exposition (default HTTP metrics + CertWatch
+# gauges from app/metrics.py). Deliberately unauthenticated -- restrict access
+# at the network layer (firewall/reverse-proxy allowlist) in production.
+setup_metrics(app)
 
 
 def _seed_settings() -> None:
