@@ -6,6 +6,9 @@ responses. See `.env.example`.
 """
 from __future__ import annotations
 
+import secrets as _pysecrets
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -53,6 +56,38 @@ class Settings(BaseSettings):
     # is a bcrypt hash string, never a plaintext password.
     admin_email: str = ""
     admin_password_hash: str = ""
+
+    # Session cookie signing key (Task 4). If unset, a random per-process key
+    # is generated below (ponytail: fine for dev/single-instance; set
+    # CERTWATCH_SESSION_SECRET explicitly anywhere sessions must survive a
+    # restart or be shared across multiple app processes).
+    session_secret: str = ""
+    # Set to false only for local HTTP dev without TLS; production must be true.
+    cookie_secure: bool = True
+
+    # Entra ID (Azure AD) OIDC app registration. Empty tenant/client disables
+    # the real IdP path; tests exercise the callback via a monkeypatched
+    # app.auth._fetch_token and never need these populated.
+    entra_tenant_id: str = ""
+    entra_client_id: str = ""
+    entra_client_secret: str = ""
+    entra_redirect_uri: str = ""
+
+    # Comma-separated Entra group object IDs mapped to each role. The highest
+    # role whose group set intersects the user's IdP groups wins; no match
+    # falls back to "viewer". See app.auth.map_groups_to_role.
+    entra_admin_group: str = ""
+    entra_operator_group: str = ""
+    entra_viewer_group: str = ""
+
+    @model_validator(mode="after")
+    def _fill_ephemeral_session_secret(self) -> "Settings":
+        # ponytail: no CERTWATCH_SESSION_SECRET configured — generate a random
+        # per-process secret so login still works in dev/tests. Every process
+        # restart invalidates existing session cookies until this is set.
+        if not self.session_secret:
+            self.session_secret = _pysecrets.token_hex(32)
+        return self
 
     @property
     def cors_origin_list(self) -> list[str]:

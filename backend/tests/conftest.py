@@ -8,6 +8,12 @@ import tempfile
 from cryptography.fernet import Fernet
 
 os.environ["CERTWATCH_ENABLE_SCHEDULER"] = "false"
+# TestClient talks to http://testserver (no TLS). httpx's cookie jar honors
+# the Secure flag like a real browser, so a Secure session cookie would never
+# be sent back on the next request and every "logged in" test would silently
+# 401. This only relaxes the *test* environment, not the SessionMiddleware
+# wiring itself (which still defaults to https_only=True in main.py).
+os.environ.setdefault("CERTWATCH_COOKIE_SECURE", "false")
 _fd, _path = tempfile.mkstemp(suffix=".db")
 os.close(_fd)
 os.environ["CERTWATCH_DATABASE_URL"] = f"sqlite:///{_path}"
@@ -47,5 +53,10 @@ def db():
 @pytest.fixture
 def client():
     Base.metadata.drop_all(engine)
-    with TestClient(app) as c:  # lifespan creates tables + seeds settings
+    # follow_redirects=False: auth.login/callback may redirect to Entra/the
+    # frontend; auto-following in tests would make httpx attempt a real
+    # network request to those external URLs. The client is a single
+    # TestClient/httpx.Client instance per test, so its cookie jar (and thus
+    # the signed session cookie) is shared across calls within one test.
+    with TestClient(app, follow_redirects=False) as c:  # lifespan creates tables + seeds settings
         yield c

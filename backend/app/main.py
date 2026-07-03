@@ -15,9 +15,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import Session
+from starlette.middleware.sessions import SessionMiddleware
 
 from . import schemas, targets as target_lib
 from .alerts import dispatch_alerts, evaluate_alerts
+from .auth import router as auth_router
 from .config import settings
 from .secrets import SecretsNotConfigured, encrypt as encrypt_secret, is_encrypted
 from .db import get_db, init_db
@@ -67,6 +69,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.session_secret,
+    https_only=settings.cookie_secure,
+    same_site="lax",
+)
+app.include_router(auth_router)
 
 
 def _seed_settings() -> None:
