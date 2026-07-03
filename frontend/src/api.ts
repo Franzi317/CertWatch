@@ -90,6 +90,11 @@ export interface Channel {
   id: number; name: string; channel_type: string; enabled: boolean; re_alert_hours: number;
   config_summary: Record<string, any>;
 }
+export interface Issuer {
+  id: number; name: string; issuer_type: string; enabled: boolean;
+  last_test_at: string | null; last_test_ok: boolean; created_at: string;
+  config: Record<string, any>;
+}
 export interface Dashboard {
   total_certificates: number; total_endpoints: number; expiring_90d: number; expiring_30d: number;
   expiring_7d: number; expired: number; failed_scans: number; recently_changed: number;

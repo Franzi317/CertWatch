@@ -74,5 +74,24 @@ class TestNotifyIn(BaseModel):
     channel_id: int
 
 
+class IssuerIn(BaseModel):
+    name: str
+    issuer_type: str  # adcs | acme
+    enabled: bool = True
+    config: dict = Field(default_factory=dict)
+
+
+class IssuerOut(BaseModel):
+    id: int
+    name: str
+    issuer_type: str
+    enabled: bool
+    last_test_at: datetime | None = None
+    last_test_ok: bool = False
+    created_at: datetime
+    # config scrubbed of secrets; only non-sensitive keys + "<key>_set" markers
+    config: dict = Field(default_factory=dict)
+
+
 class AlertActionIn(BaseModel):
     mute_hours: int | None = None  # for mute; None = indefinite

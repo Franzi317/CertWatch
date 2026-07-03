@@ -46,10 +46,13 @@ class ADCSAdapter(IssuerAdapter):
         # httpx-ntlm) is out of scope for this task -- basic auth is the
         # ceiling here until this is tested against a real DC, at which
         # point swap this for an NTLM-capable auth object.
-        from app.secrets import decrypt
+        from app.secrets import SecretsNotConfigured, decrypt
 
-        username = decrypt(self._username_enc)
-        password = decrypt(self._password_enc)
+        try:
+            username = decrypt(self._username_enc)
+            password = decrypt(self._password_enc)
+        except SecretsNotConfigured as e:
+            raise IssuerError(f"cannot decrypt AD CS credentials: {e}") from e
         return httpx.BasicAuth(username, password)
 
     # -- network seam: tests monkeypatch these two methods directly --------

@@ -24,6 +24,7 @@ from .auth import require_role, router as auth_router
 from .config import settings
 from .secrets import SecretsNotConfigured, encrypt as encrypt_secret, is_encrypted
 from .db import engine, get_db, init_db, run_migrations
+from .issuers.base import IssuerError, get_adapter
 from .models import (
     AcmeChallenge,
     AlertEvent,
@@ -31,6 +32,7 @@ from .models import (
     Certificate,
     CertificateObservation,
     Endpoint,
+    Issuer,
     NotificationChannel,
     ScanJob,
     SystemSetting,
@@ -607,6 +609,138 @@ def test_channel(channel_id: int, db: Session = Depends(get_db)):
     except NotifyError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"status": "sent"}
+
+
+# --------------------------------------------------------------------------- #
+# Issuers (CA integrations: AD CS, ACME)
+# --------------------------------------------------------------------------- #
+# Which config keys are secret, per issuer type. Everything else in `config`
+# is considered non-sensitive and echoed back as-is (e.g. contact_email).
+_ISSUER_SECRET_KEYS = {
+    "adcs": {"username", "password"},
+    "acme": {"account_key_pem"},
+}
+
+
+def _encrypt_issuer_secrets(issuer_type: str, config: dict) -> dict:
+    """Encrypt secret-shaped values for this issuer type that aren't already
+    encrypted. Raises SecretsNotConfigured (via app.secrets.encrypt) if
+    CERTWATCH_MASTER_KEY isn't set and a plaintext secret needs encrypting."""
+    secret_keys = _ISSUER_SECRET_KEYS.get(issuer_type, set())
+    out = dict(config or {})
+    for k in secret_keys:
+        v = out.get(k)
+        if v and not is_encrypted(v):
+            out[k] = encrypt_secret(v)
+    return out
+
+
+def _issuer_out(issuer: Issuer) -> dict:
+    secret_keys = _ISSUER_SECRET_KEYS.get(issuer.issuer_type, set())
+    config = issuer.config or {}
+    summary = {k: v for k, v in config.items() if k not in secret_keys}
+    for k in secret_keys:
+        if k in config:
+            summary[f"{k}_set"] = bool(config.get(k))
+    return {
+        "id": issuer.id,
+        "name": issuer.name,
+        "issuer_type": issuer.issuer_type,
+        "enabled": issuer.enabled,
+        "last_test_at": issuer.last_test_at,
+        "last_test_ok": issuer.last_test_ok,
+        "created_at": issuer.created_at,
+        "config": summary,
+    }
+
+
+@app.get("/api/issuers", dependencies=[Depends(require_role("viewer"))])
+def list_issuers(db: Session = Depends(get_db)):
+    return [_issuer_out(i) for i in db.scalars(select(Issuer)).all()]
+
+
+@app.post("/api/issuers", status_code=201)
+def create_issuer(
+    body: schemas.IssuerIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("admin")),
+):
+    data = body.model_dump()
+    try:
+        data["config"] = _encrypt_issuer_secrets(data["issuer_type"], data.get("config") or {})
+    except SecretsNotConfigured as e:
+        raise HTTPException(400, str(e))
+    issuer = Issuer(**data)
+    db.add(issuer)
+    db.flush()
+    audit(db, principal["email"], "issuer.create", "issuer", issuer.id, issuer.name)
+    db.commit()
+    return _issuer_out(issuer)
+
+
+@app.put("/api/issuers/{issuer_id}")
+def update_issuer(
+    issuer_id: int,
+    body: schemas.IssuerIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("admin")),
+):
+    issuer = db.get(Issuer, issuer_id)
+    if not issuer:
+        raise HTTPException(404, "issuer not found")
+    secret_keys = _ISSUER_SECRET_KEYS.get(body.issuer_type, set())
+    # Merge config so a blank secret field doesn't wipe an existing one.
+    new_config = dict(issuer.config or {})
+    for k, v in (body.config or {}).items():
+        if k in secret_keys and v == "":
+            continue  # keep existing secret
+        new_config[k] = v
+    try:
+        new_config = _encrypt_issuer_secrets(body.issuer_type, new_config)
+    except SecretsNotConfigured as e:
+        raise HTTPException(400, str(e))
+    issuer.name, issuer.issuer_type, issuer.enabled = body.name, body.issuer_type, body.enabled
+    issuer.config = new_config
+    audit(db, principal["email"], "issuer.update", "issuer", issuer.id, issuer.name)
+    db.commit()
+    return _issuer_out(issuer)
+
+
+@app.delete("/api/issuers/{issuer_id}", status_code=204)
+def delete_issuer(
+    issuer_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("admin")),
+):
+    issuer = db.get(Issuer, issuer_id)
+    if not issuer:
+        raise HTTPException(404, "issuer not found")
+    audit(db, principal["email"], "issuer.delete", "issuer", issuer.id, issuer.name)
+    db.delete(issuer)
+    db.commit()
+
+
+@app.post("/api/issuers/{issuer_id}/test")
+def test_issuer(
+    issuer_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    issuer = db.get(Issuer, issuer_id)
+    if not issuer:
+        raise HTTPException(404, "issuer not found")
+    ok = True
+    detail = "connection ok"
+    try:
+        get_adapter(issuer).test_connection()
+    except IssuerError as e:
+        ok = False
+        detail = str(e)
+    issuer.last_test_at = utcnow()
+    issuer.last_test_ok = ok
+    audit(db, principal["email"], "issuer.test", "issuer", issuer.id, detail)
+    db.commit()
+    return {"ok": ok, "detail": detail}
 
 
 # --------------------------------------------------------------------------- #

@@ -81,10 +81,13 @@ class AcmeHttp01Adapter(IssuerAdapter):
 
     # -- account key: generated + encrypted on first use --------------------
     def _account_key_pem(self) -> str:
-        from app.secrets import decrypt, encrypt
+        from app.secrets import SecretsNotConfigured, decrypt, encrypt
 
         if self._account_key_enc:
-            return decrypt(self._account_key_enc)
+            try:
+                return decrypt(self._account_key_enc)
+            except SecretsNotConfigured as e:
+                raise IssuerError(f"cannot decrypt ACME account key: {e}") from e
 
         from app.crypto_keys import generate_private_key
 
