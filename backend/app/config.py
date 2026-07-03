@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     # Path to built frontend (served as static in production). Empty = API only.
     static_dir: str = ""
 
+    # Fernet key (urlsafe-base64, 32 bytes) used to envelope-encrypt notification
+    # channel secrets (SMTP password, webhook URL) at rest. Generate with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # Empty = secret writes are refused (see app.secrets.SecretsNotConfigured).
+    master_key: str = ""
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

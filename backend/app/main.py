@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from . import schemas, targets as target_lib
 from .alerts import dispatch_alerts, evaluate_alerts
 from .config import settings
+from .secrets import SecretsNotConfigured, encrypt as encrypt_secret, is_encrypted
 from .db import get_db, init_db
 from .models import (
     AlertEvent,
@@ -420,6 +421,20 @@ def evaluate(db: Session = Depends(get_db)):
 _SECRET_KEYS = {"password", "url"}
 
 
+def _encrypt_secrets(config: dict) -> dict:
+    """Encrypt secret-shaped values (password, url) that aren't already encrypted.
+
+    Raises SecretsNotConfigured (via app.secrets.encrypt) if CERTWATCH_MASTER_KEY
+    isn't set and a plaintext secret needs encrypting.
+    """
+    out = dict(config or {})
+    for k in _SECRET_KEYS:
+        v = out.get(k)
+        if v and not is_encrypted(v):
+            out[k] = encrypt_secret(v)
+    return out
+
+
 def _channel_out(ch: NotificationChannel) -> dict:
     summary = {k: v for k, v in (ch.config or {}).items() if k not in _SECRET_KEYS}
     if "url" in (ch.config or {}):
@@ -439,7 +454,12 @@ def list_channels(db: Session = Depends(get_db)):
 
 @app.post("/api/channels", dependencies=[Depends(require_auth)], status_code=201)
 def create_channel(body: schemas.ChannelIn, db: Session = Depends(get_db)):
-    ch = NotificationChannel(**body.model_dump())
+    data = body.model_dump()
+    try:
+        data["config"] = _encrypt_secrets(data.get("config") or {})
+    except SecretsNotConfigured as e:
+        raise HTTPException(400, str(e))
+    ch = NotificationChannel(**data)
     db.add(ch)
     db.flush()
     audit(db, "channel.create", "channel", ch.id, ch.name)
@@ -458,6 +478,10 @@ def update_channel(channel_id: int, body: schemas.ChannelIn, db: Session = Depen
         if k in _SECRET_KEYS and v == "":
             continue  # keep existing secret
         new_config[k] = v
+    try:
+        new_config = _encrypt_secrets(new_config)
+    except SecretsNotConfigured as e:
+        raise HTTPException(400, str(e))
     ch.name, ch.channel_type, ch.enabled, ch.re_alert_hours = (
         body.name, body.channel_type, body.enabled, body.re_alert_hours)
     ch.config = new_config
