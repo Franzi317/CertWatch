@@ -96,3 +96,53 @@ class IssuerOut(BaseModel):
 
 class AlertActionIn(BaseModel):
     mute_hours: int | None = None  # for mute; None = indefinite
+
+
+class RenewalPolicyIn(BaseModel):
+    name: str
+    renew_before_days: int = 30
+    key_algorithm: str = "rsa"
+    key_size: int = 2048
+    require_approval: bool = True
+    verify_after_deploy: bool = True
+    max_retries: int = 3
+
+
+class RenewalPolicyOut(RenewalPolicyIn):
+    id: int
+    created_at: datetime
+    model_config = {"from_attributes": True}
+
+
+class ManagedCertificateIn(BaseModel):
+    common_name: str
+    sans: list[str] = Field(default_factory=list)
+    issuer_id: int
+    renewal_policy_id: int
+    owner: str = ""
+    environment: str = "prod"
+
+
+class ManagedCertificateOut(BaseModel):
+    id: int
+    common_name: str
+    sans: list[str] = Field(default_factory=list)
+    issuer_id: int
+    renewal_policy_id: int
+    current_certificate_id: int | None = None
+    state: str
+    owner: str
+    environment: str
+    created_at: datetime
+    updated_at: datetime
+    # convenience fields joined from the current observed Certificate, if any
+    current_cert_common_name: str | None = None
+    current_cert_not_after: datetime | None = None
+    model_config = {"from_attributes": True}
+
+
+class ManageIn(BaseModel):
+    """Body for POST /api/certificates/{id}/manage -- promotes an observed
+    Certificate into a ManagedCertificate under the given issuer/policy."""
+    issuer_id: int
+    renewal_policy_id: int

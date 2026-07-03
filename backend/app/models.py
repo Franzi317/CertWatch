@@ -258,6 +258,47 @@ class Issuer(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class RenewalPolicy(Base):
+    """Rules governing how a ManagedCertificate is renewed: lead time, key
+    material for the new cert, whether a human must approve before issuance,
+    and post-deploy verification/retry behavior."""
+
+    __tablename__ = "renewal_policies"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    renew_before_days: Mapped[int] = mapped_column(Integer, default=30)
+    key_algorithm: Mapped[str] = mapped_column(String(16), default="rsa")
+    key_size: Mapped[int] = mapped_column(Integer, default=2048)
+    require_approval: Mapped[bool] = mapped_column(Boolean, default=True)
+    verify_after_deploy: Mapped[bool] = mapped_column(Boolean, default=True)
+    max_retries: Mapped[int] = mapped_column(Integer, default=3)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ManagedCertificate(Base):
+    """A lifecycle-managed certificate: created directly or by promoting an
+    observed inventory `Certificate` (see `/api/certificates/{id}/manage` in
+    main.py). References the observed cert via `current_certificate_id`
+    rather than merging into it -- the inventory table stays the deduped
+    scan artifact; this table is the operator-facing management record."""
+
+    __tablename__ = "managed_certificates"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    common_name: Mapped[str] = mapped_column(String(255), default="")
+    sans: Mapped[list] = mapped_column(JSON, default=list)
+    issuer_id: Mapped[int] = mapped_column(ForeignKey("issuers.id"))
+    renewal_policy_id: Mapped[int] = mapped_column(ForeignKey("renewal_policies.id"))
+    current_certificate_id: Mapped[int | None] = mapped_column(ForeignKey("certificates.id"))
+    # state: active | renewing | error | retired (validated in the app layer, not the DB)
+    state: Mapped[str] = mapped_column(String(16), default="active")
+    owner: Mapped[str] = mapped_column(String(255), default="")
+    environment: Mapped[str] = mapped_column(String(64), default="prod")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class AcmeChallenge(Base):
     """Pending ACME HTTP-01 challenges. The public `/.well-known/acme-challenge/{token}`
     route (main.py) serves `key_authorization` for a row here; the ACME adapter

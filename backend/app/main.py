@@ -33,7 +33,9 @@ from .models import (
     CertificateObservation,
     Endpoint,
     Issuer,
+    ManagedCertificate,
     NotificationChannel,
+    RenewalPolicy,
     ScanJob,
     SystemSetting,
     Target,
@@ -747,6 +749,100 @@ def test_issuer(
     audit(db, principal["email"], "issuer.test", "issuer", issuer.id, detail)
     db.commit()
     return {"ok": ok, "detail": detail}
+
+
+# --------------------------------------------------------------------------- #
+# Renewal policies + managed certificates (lifecycle management, Phase 1)
+# --------------------------------------------------------------------------- #
+@app.get("/api/renewal-policies", dependencies=[Depends(require_role("viewer"))])
+def list_renewal_policies(db: Session = Depends(get_db)):
+    rows = db.scalars(select(RenewalPolicy)).all()
+    return [schemas.RenewalPolicyOut.model_validate(p).model_dump() for p in rows]
+
+
+@app.post("/api/renewal-policies", status_code=201)
+def create_renewal_policy(
+    body: schemas.RenewalPolicyIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    policy = RenewalPolicy(**body.model_dump())
+    db.add(policy)
+    db.flush()
+    audit(db, principal["email"], "renewal_policy.create", "renewal_policy", policy.id, policy.name)
+    db.commit()
+    return schemas.RenewalPolicyOut.model_validate(policy).model_dump()
+
+
+def _managed_cert_out(db: Session, m: ManagedCertificate) -> dict:
+    out = schemas.ManagedCertificateOut.model_validate(m).model_dump()
+    if m.current_certificate_id:
+        cert = db.get(Certificate, m.current_certificate_id)
+        if cert:
+            out["current_cert_common_name"] = cert.common_name
+            out["current_cert_not_after"] = cert.not_after
+    return out
+
+
+def _require_issuer_and_policy(db: Session, issuer_id: int, renewal_policy_id: int) -> None:
+    if not db.get(Issuer, issuer_id):
+        raise HTTPException(400, "issuer not found")
+    if not db.get(RenewalPolicy, renewal_policy_id):
+        raise HTTPException(400, "renewal policy not found")
+
+
+@app.get("/api/managed-certificates", dependencies=[Depends(require_role("viewer"))])
+def list_managed_certificates(db: Session = Depends(get_db)):
+    rows = db.scalars(select(ManagedCertificate)).all()
+    return [_managed_cert_out(db, m) for m in rows]
+
+
+@app.get("/api/managed-certificates/{managed_id}", dependencies=[Depends(require_role("viewer"))])
+def get_managed_certificate(managed_id: int, db: Session = Depends(get_db)):
+    m = db.get(ManagedCertificate, managed_id)
+    if not m:
+        raise HTTPException(404, "managed certificate not found")
+    return _managed_cert_out(db, m)
+
+
+@app.post("/api/managed-certificates", status_code=201)
+def create_managed_certificate(
+    body: schemas.ManagedCertificateIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    _require_issuer_and_policy(db, body.issuer_id, body.renewal_policy_id)
+    m = ManagedCertificate(**body.model_dump())
+    db.add(m)
+    db.flush()
+    audit(db, principal["email"], "managed_cert.create", "managed_certificate", m.id, m.common_name)
+    db.commit()
+    return _managed_cert_out(db, m)
+
+
+@app.post("/api/certificates/{cert_id}/manage", status_code=201)
+def promote_certificate(
+    cert_id: int,
+    body: schemas.ManageIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    cert = db.get(Certificate, cert_id)
+    if not cert:
+        raise HTTPException(404, "certificate not found")
+    _require_issuer_and_policy(db, body.issuer_id, body.renewal_policy_id)
+    m = ManagedCertificate(
+        common_name=cert.common_name,
+        sans=list(cert.sans or []),
+        issuer_id=body.issuer_id,
+        renewal_policy_id=body.renewal_policy_id,
+        current_certificate_id=cert.id,
+    )
+    db.add(m)
+    db.flush()
+    audit(db, principal["email"], "managed_cert.promote", "managed_certificate", m.id, cert.common_name)
+    db.commit()
+    return _managed_cert_out(db, m)
 
 
 # --------------------------------------------------------------------------- #
