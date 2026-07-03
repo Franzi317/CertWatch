@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     # Run the in-process scheduler (set false when running pure API/worker splits).
     enable_scheduler: bool = True
 
+    # Run a queue-draining worker loop on a background thread inside the API
+    # process (dev/SQLite one-container quickstart). Set false in production
+    # (docker-compose's dedicated `worker` service) so the API process doesn't
+    # also compete to claim queue items.
+    embedded_worker: bool = True
+
     # IANA timezone that calendar schedules (daily/weekly/monthly start times) are
     # interpreted in. Falls back to UTC if unset or invalid. DST-aware via zoneinfo.
     timezone: str = "UTC"

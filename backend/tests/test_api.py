@@ -1,8 +1,7 @@
-import time
-
 import pytest
 
-from app import scan_engine
+from app import scan_engine, worker
+from app.db import SessionLocal
 from app.scanner import ScanResult
 from conftest import login_as
 
@@ -74,11 +73,15 @@ def test_scan_job_creation_and_dedup(client, monkeypatch):
     assert r.status_code == 202
     jid = r.json()["id"]
 
-    for _ in range(50):
-        job = client.get(f"/api/scans/{jid}").json()
-        if job["status"] in ("completed", "failed", "cancelled"):
-            break
-        time.sleep(0.1)
+    # No embedded worker runs during tests (CERTWATCH_EMBEDDED_WORKER=false,
+    # see conftest.py) -- drain the queue item explicitly and deterministically.
+    wdb = SessionLocal()
+    try:
+        assert worker.process_one(wdb) is True
+    finally:
+        wdb.close()
+
+    job = client.get(f"/api/scans/{jid}").json()
     assert job["status"] == "completed"
     assert job["total_endpoints"] == 2          # two ports
     assert job["certs_found"] == 2

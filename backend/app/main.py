@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
@@ -39,6 +40,7 @@ from .notify import NotifyError, send_email, send_webhook
 from .scheduler import enqueue_scan, shutdown_scheduler, start_scheduler
 from .serialize import cert_dict, endpoint_dict, observation_dict
 from .status import days_until
+from . import worker as worker_lib
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("certwatch")
@@ -57,7 +59,23 @@ async def lifespan(app: FastAPI):
     _seed_settings()
     if settings.enable_scheduler:
         start_scheduler()
+    worker_stop_event = None
+    worker_thread = None
+    if settings.embedded_worker:
+        # One-container dev/SQLite quickstart: drain the queue in-process
+        # instead of requiring the dedicated `worker` service (see
+        # docker-compose.yml, CERTWATCH_EMBEDDED_WORKER=false in prod).
+        worker_stop_event = threading.Event()
+        worker_thread = threading.Thread(
+            target=worker_lib.run_forever,
+            kwargs={"stop_event": worker_stop_event},
+            daemon=True,
+        )
+        worker_thread.start()
+        log.info("embedded worker thread started")
     yield
+    if worker_stop_event is not None:
+        worker_stop_event.set()
     shutdown_scheduler()
 
 

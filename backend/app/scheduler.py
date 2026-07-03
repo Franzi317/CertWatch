@@ -8,31 +8,28 @@ ponytail: in-process scheduler; move to a broker if you run multiple API replica
 from __future__ import annotations
 
 import logging
-import threading
 from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import select
 
+from . import queue
 from .config import settings
 from .db import SessionLocal
 from .models import ScanJob, Target, utcnow
-from .scan_engine import run_scan_job
 
 log = logging.getLogger("certwatch.scheduler")
 _scheduler: BackgroundScheduler | None = None
 
 
-def start_job_thread(job_id: int) -> None:
-    """Run a scan job in a daemon thread so the request returns immediately."""
-    threading.Thread(target=run_scan_job, args=(job_id,), daemon=True).start()
-
-
 def enqueue_scan(db, target: Target, trigger: str = "manual") -> ScanJob:
+    """Create the ScanJob row and hand it to the Task 7/8 work queue instead
+    of running it in-process. A worker (embedded thread or the dedicated
+    `worker` service) claims and executes it (see `app.worker.process_one`)."""
     job = ScanJob(target_id=target.id, target_name=target.name, status="pending", trigger=trigger)
     db.add(job)
     db.commit()
-    start_job_thread(job.id)
+    queue.enqueue(db, "scan", {"scan_job_id": job.id})
     return job
 
 

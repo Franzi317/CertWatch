@@ -8,6 +8,10 @@ import tempfile
 from cryptography.fernet import Fernet
 
 os.environ["CERTWATCH_ENABLE_SCHEDULER"] = "false"
+# The API TestClient must not spawn a racing background worker thread during
+# tests (Task 8) -- queue draining is done explicitly via worker.process_one
+# so tests stay deterministic.
+os.environ["CERTWATCH_EMBEDDED_WORKER"] = "false"
 # TestClient talks to http://testserver (no TLS). httpx's cookie jar honors
 # the Secure flag like a real browser, so a Secure session cookie would never
 # be sent back on the next request and every "logged in" test would silently
