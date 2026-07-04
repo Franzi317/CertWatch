@@ -82,11 +82,15 @@ class IisConnector:
 
             code, output = _run_powershell(script)
             if code != 0:
-                # `output` is whatever PowerShell printed to stdout/stderr --
-                # never the script text itself, so the password embedded in
-                # the script cannot leak into this error via `output` unless
-                # the script explicitly printed it (it never does).
-                raise DeployError(f"iis deploy failed (exit {code}): {output}")
+                # `output` is whatever PowerShell printed to stdout/stderr. If
+                # a statement in the script throws, PowerShell's default
+                # error formatter can echo the failing SOURCE LINE -- which
+                # includes the plaintext password embedded in the
+                # `ConvertTo-SecureString` call -- into that output. Redact
+                # every occurrence of the decrypted password before it goes
+                # anywhere near an exception message or persisted result.
+                safe_output = output.replace(password, "***") if password else output
+                raise DeployError(f"iis deploy failed (exit {code}): {safe_output}")
         finally:
             try:
                 os.remove(pfx_path)
@@ -125,8 +129,14 @@ def _build_script(pfx_path: str, password: str, site_name: str, binding: str) ->
     """
     protocol, binding_info = _split_binding(binding)
 
+    # The comment line below is not `_ps_quote`d (it's not a PS string
+    # literal, just a `#` comment) -- strip newlines so an embedded
+    # CR/LF in `site_name`/`binding` can't break out of the comment and
+    # get interpreted as executable PowerShell on the next line.
+    _c = lambda s: str(s).replace("\r", " ").replace("\n", " ")
+
     return f"""$ErrorActionPreference = 'Stop'
-# CertWatch IIS deploy: site='{site_name}' binding='{binding}'
+# CertWatch IIS deploy: site='{_c(site_name)}' binding='{_c(binding)}'
 Import-Module WebAdministration -ErrorAction SilentlyContinue
 
 $securePwd = ConvertTo-SecureString '{_ps_quote(password)}' -AsPlainText -Force

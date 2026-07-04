@@ -158,6 +158,46 @@ def test_iis_connector_deploy_requires_site_name_and_binding():
         IisConnector(target).deploy(_bundle())
 
 
+def test_iis_connector_deploy_redacts_password_echoed_in_powershell_output(monkeypatch):
+    # Simulate PowerShell's default error formatter echoing the failing
+    # source line (which contains the plaintext password embedded in the
+    # `ConvertTo-SecureString` call) back on stderr.
+    monkeypatch.setattr(
+        iis_mod,
+        "_run_powershell",
+        lambda script: (
+            1,
+            "At line:3 : ConvertTo-SecureString 's3cretpw' -AsPlainText ... error",
+        ),
+    )
+    target = _target(password="s3cretpw")
+
+    with pytest.raises(DeployError) as excinfo:
+        IisConnector(target).deploy(_bundle())
+
+    assert "s3cretpw" not in str(excinfo.value)
+    assert "***" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------
+# _build_script comment-line sanitization
+# --------------------------------------------------------------------------
+
+def test_build_script_sanitizes_newline_in_site_name_comment():
+    script = _build_script(
+        "C:\\temp\\deploy.pfx",
+        "hunter2",
+        "Default Web Site\nStop-Computer",
+        "https://:443:iis.example.com",
+    )
+
+    comment_line = next(line for line in script.splitlines() if line.startswith("#"))
+    assert "Stop-Computer" in comment_line
+    assert not any(
+        line.strip() == "Stop-Computer" for line in script.splitlines()
+    )
+
+
 # --------------------------------------------------------------------------
 # get_connector dispatch
 # --------------------------------------------------------------------------
