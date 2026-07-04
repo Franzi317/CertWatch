@@ -86,6 +86,14 @@ class Settings(BaseSettings):
     entra_operator_group: str = ""
     entra_viewer_group: str = ""
 
+    # Crypto-risk rule thresholds (app.findings). May be overridden per-key by
+    # a SystemSetting row via alerts.get_setting (read-through, same pattern
+    # as scan_failure_threshold / alert_on_self_signed).
+    finding_min_rsa_bits: int = 2048
+    finding_min_ec_bits: int = 256
+    finding_max_lifetime_days: int = 398
+    finding_deprecated_sig_substrings: str = "sha1,md5"
+
     @model_validator(mode="after")
     def _fill_ephemeral_session_secret(self) -> "Settings":
         # ponytail: no CERTWATCH_SESSION_SECRET configured — generate a random
@@ -102,6 +110,10 @@ class Settings(BaseSettings):
     @property
     def internal_ca_pattern_list(self) -> list[str]:
         return [p.strip() for p in self.internal_ca_patterns.split(",") if p.strip()]
+
+    @property
+    def finding_deprecated_sig_list(self) -> list[str]:
+        return [p.strip() for p in self.finding_deprecated_sig_substrings.split(",") if p.strip()]
 
     @property
     def tzinfo(self):
