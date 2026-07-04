@@ -24,11 +24,22 @@ from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from sqlalchemy.orm.attributes import flag_modified
 
+from sqlalchemy import select
+
 from . import lifecycle, queue, scan_engine, secrets
 from .crypto_keys import build_csr, generate_private_key
 from .db import SessionLocal
+from .deploy.base import CertBundle, DeployError, DeployResult, get_connector
 from .issuers.base import get_adapter
-from .models import Issuer, LifecycleOrder, ManagedCertificate, RenewalPolicy
+from .models import (
+    Certificate,
+    DeploymentTarget,
+    Issuer,
+    LifecycleOrder,
+    ManagedCertificate,
+    RenewalPolicy,
+    utcnow,
+)
 from .scanner import parse_certificate
 
 log = logging.getLogger("certwatch.worker")
@@ -53,6 +64,8 @@ def process_one(db) -> bool:
             queue.complete(db, item)
     elif item.kind in ("issue", "renew"):
         _process_issuance(db, item)
+    elif item.kind == "deploy":
+        _process_deploy(db, item)
     else:
         queue.fail(db, item, f"unknown kind: {item.kind}")
 
@@ -129,6 +142,101 @@ def _process_issuance(db, item) -> None:
         queue.fail(db, item, str(e))
     else:
         queue.complete(db, item)
+
+
+def _process_deploy(db, item) -> None:
+    """Run the `deploy` queue step: push the ManagedCertificate's current
+    cert+key to every enabled `DeploymentTarget` linked to it, then advance
+    the order to `verifying` (Task 12 owns actually verifying anything).
+
+    A ManagedCertificate with NO deployment targets configured still
+    transitions straight to `verifying` -- there's nothing to deploy, and
+    treating "no targets" as a failure would make it impossible to issue a
+    cert that isn't yet wired to any target. Verify/complete handle that
+    order the same way a zero-target one flows through downstream.
+
+    Fail-closed: if any target's connector fails, the order goes to
+    `failed` and the managed cert's state becomes `error` -- no partial
+    "some targets got the new cert, some didn't" success is reported.
+    """
+    order_id = item.payload.get("order_id")
+    order = db.get(LifecycleOrder, order_id) if order_id is not None else None
+    if order is None:
+        queue.fail(db, item, f"lifecycle order {order_id!r} not found")
+        return
+
+    if order.status != "deploying":
+        # Already processed (stale/duplicate queue item, or a retry after
+        # the previous attempt actually succeeded) -- nothing to do.
+        log.info("order %s not in deploying state (status=%s), skipping deploy", order.id, order.status)
+        queue.complete(db, item)
+        return
+
+    managed: ManagedCertificate | None = None
+    try:
+        managed = db.get(ManagedCertificate, order.managed_certificate_id)
+        if managed is None:
+            raise RuntimeError(f"managed certificate {order.managed_certificate_id} not found")
+
+        cert = db.get(Certificate, managed.current_certificate_id)
+        if cert is None:
+            raise RuntimeError(f"current certificate {managed.current_certificate_id} not found")
+        if not managed.current_key_ref:
+            raise RuntimeError("managed certificate has no current_key_ref (private key)")
+
+        cert_pem, chain_pem = _split_leaf_and_chain(cert.pem)
+        # Decrypted only here, in memory, for the duration of this deploy --
+        # never logged, never persisted in plaintext.
+        key_pem = secrets.decrypt(managed.current_key_ref)
+        bundle = CertBundle(cert_pem=cert_pem, chain_pem=chain_pem, key_pem=key_pem)
+
+        targets = db.scalars(
+            select(DeploymentTarget).where(
+                DeploymentTarget.managed_certificate_id == managed.id,
+                DeploymentTarget.enabled.is_(True),
+            )
+        ).all()
+
+        all_ok = True
+        first_error = ""
+        for target in targets:
+            try:
+                result = get_connector(target).deploy(bundle)
+            except DeployError as e:
+                result = DeployResult(ok=False, detail=str(e))
+            target.last_deploy_at = utcnow()
+            target.last_deploy_ok = result.ok
+            if not result.ok:
+                all_ok = False
+                first_error = first_error or result.detail
+
+        db.commit()
+
+        if not all_ok:
+            raise DeployError(first_error or "one or more deployment targets failed")
+
+        lifecycle.transition(db, order, "verifying")
+        queue.enqueue(db, "verify", {"order_id": order.id})
+    except Exception as e:  # noqa: BLE001 - fail-closed: no partial deploy success
+        log.exception("deploy failed for order %s (queue item %s)", order_id, item.id)
+        db.rollback()
+        lifecycle.transition(db, order, "failed", str(e))
+        if managed is not None:
+            managed.state = "error"
+            db.commit()
+        queue.fail(db, item, str(e))
+    else:
+        queue.complete(db, item)
+
+
+def _split_leaf_and_chain(pem_blob: str) -> tuple[str, str]:
+    """`Certificate.pem` stores the leaf cert concatenated with its chain
+    (see `scanner.parse_certificate`'s `"pem": "".join(chain_pem)`, where
+    `chain_pem[0]` is the leaf). Split it back into (leaf, rest-of-chain)."""
+    blocks = [b + "\n" for b in _PEM_CERT_RE.findall(pem_blob)]
+    if not blocks:
+        return pem_blob, ""
+    return blocks[0], "".join(blocks[1:])
 
 
 def _store_issued_cert(db, issued):

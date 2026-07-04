@@ -332,6 +332,35 @@ class LifecycleOrder(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class DeploymentTarget(Base):
+    """Where a ManagedCertificate's renewed material gets pushed once an
+    order reaches `deploying` (Task 9). `kind` selects the connector
+    (`app.deploy.get_connector`): `pem` writes plain PEM files to disk (this
+    task); `pfx`/`jks`/`iis` (Tasks 10/11) build a PKCS12 keystore, a Java
+    keystore, or push into IIS's certificate store, respectively.
+
+    `config` holds connector-specific fields -- filesystem paths for `pem`,
+    keystore path + password for `pfx`/`jks`, host/credential for `iis` --
+    and MUST run secret fields (keystore/PFX passwords, WinRM creds) through
+    `app.secrets` before storing them here, same convention as Issuer.config.
+    """
+
+    __tablename__ = "deployment_targets"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    # kind: pem | pfx | jks | iis (validated in the app layer, not the DB --
+    # same convention as Issuer.issuer_type / ManagedCertificate.state)
+    kind: Mapped[str] = mapped_column(String(8))
+    config: Mapped[dict] = mapped_column(JSON, default=dict)
+    post_deploy_command: Mapped[str] = mapped_column(Text, default="")
+    managed_certificate_id: Mapped[int] = mapped_column(ForeignKey("managed_certificates.id"))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_deploy_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_deploy_ok: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class AcmeChallenge(Base):
     """Pending ACME HTTP-01 challenges. The public `/.well-known/acme-challenge/{token}`
     route (main.py) serves `key_authorization` for a row here; the ACME adapter
