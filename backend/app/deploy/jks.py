@@ -16,11 +16,10 @@ post_deploy_command rationale, which applies here unchanged).
 """
 from __future__ import annotations
 
-import os
 import subprocess
 
 from .. import crypto_keys, secrets
-from .base import CertBundle, DeployError, DeployResult
+from .base import CertBundle, DeployError, DeployResult, atomic_write
 
 
 class JksConnector:
@@ -39,7 +38,7 @@ class JksConnector:
         data = crypto_keys.build_pkcs12(
             bundle.cert_pem, bundle.chain_pem, bundle.key_pem, password, friendly_name
         )
-        _atomic_write(path, data)
+        atomic_write(path, data, restrictive=True)
 
         cmd = self.target.post_deploy_command
         if cmd:
@@ -51,29 +50,6 @@ class JksConnector:
         if cmd:
             detail += "; ran post_deploy_command"
         return DeployResult(ok=True, detail=detail)
-
-
-def _atomic_write(path: str, data: bytes) -> None:
-    """Same restrictive write-new-then-atomic-rename pattern as
-    `pfx._atomic_write` -- duplicated for the same reason (this connector's
-    output is always restrictive; see `pfx.py`)."""
-    tmp_path = f"{path}.tmp"
-    try:
-        if os.name == "posix":
-            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-        else:
-            with open(tmp_path, "wb") as f:
-                f.write(data)
-            os.chmod(tmp_path, 0o600)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-    os.replace(tmp_path, path)
 
 
 def _run_command(cmd: str) -> tuple[int, str]:

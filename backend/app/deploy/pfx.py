@@ -21,11 +21,10 @@ seam so tests never actually shell out.
 """
 from __future__ import annotations
 
-import os
 import subprocess
 
 from .. import crypto_keys, secrets
-from .base import CertBundle, DeployError, DeployResult
+from .base import CertBundle, DeployError, DeployResult, atomic_write
 
 
 class PfxConnector:
@@ -44,7 +43,7 @@ class PfxConnector:
         data = crypto_keys.build_pkcs12(
             bundle.cert_pem, bundle.chain_pem, bundle.key_pem, password, friendly_name
         )
-        _atomic_write(path, data)
+        atomic_write(path, data, restrictive=True)
 
         cmd = self.target.post_deploy_command
         if cmd:
@@ -56,34 +55,6 @@ class PfxConnector:
         if cmd:
             detail += "; ran post_deploy_command"
         return DeployResult(ok=True, detail=detail)
-
-
-def _atomic_write(path: str, data: bytes) -> None:
-    """Same restrictive write-new-then-atomic-rename pattern as
-    `pem._atomic_write(..., restrictive=True)` -- duplicated rather than
-    imported because keystore files are ALWAYS restrictive (unlike PEM
-    connector's mixed cert/key files), so there is no non-restrictive branch
-    to share."""
-    tmp_path = f"{path}.tmp"
-    try:
-        if os.name == "posix":
-            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-        else:
-            with open(tmp_path, "wb") as f:
-                f.write(data)
-            # Best-effort on Windows: os.chmod has very limited effect on
-            # NTFS ACLs there, so this is hardening, not a security boundary
-            # on that platform.
-            os.chmod(tmp_path, 0o600)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-    os.replace(tmp_path, path)
 
 
 def _run_command(cmd: str) -> tuple[int, str]:

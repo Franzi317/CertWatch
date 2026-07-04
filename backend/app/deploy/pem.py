@@ -29,10 +29,9 @@ in that case, and a re-deploy (retry) fixes the mismatch.
 """
 from __future__ import annotations
 
-import os
 import subprocess
 
-from .base import CertBundle, DeployError, DeployResult
+from .base import CertBundle, DeployError, DeployResult, atomic_write
 
 # DeploymentTarget.config key -> CertBundle attribute
 _FILES = {
@@ -54,7 +53,7 @@ class PemConnector:
             if not path:
                 continue
             content = getattr(bundle, attr)
-            _atomic_write(path, content.encode(), restrictive=(config_key == "key_path"))
+            atomic_write(path, content.encode(), restrictive=(config_key == "key_path"))
             written.append(path)
 
         cmd = self.target.post_deploy_command
@@ -67,36 +66,6 @@ class PemConnector:
         if cmd:
             detail += "; ran post_deploy_command"
         return DeployResult(ok=True, detail=detail)
-
-
-def _atomic_write(path: str, data: bytes, restrictive: bool = False) -> None:
-    tmp_path = f"{path}.tmp"
-    try:
-        if restrictive and os.name == "posix":
-            # Create the temp file with 0600 baked into the open() call
-            # itself, so the plaintext key is never briefly world/group-
-            # readable at the default umask between creation and a later
-            # chmod -- it is 0600 from the instant it exists on disk.
-            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-        else:
-            with open(tmp_path, "wb") as f:
-                f.write(data)
-            if restrictive:
-                # Best-effort on Windows: os.chmod has very limited effect
-                # on NTFS ACLs there, so this is hardening, not a security
-                # boundary on that platform.
-                os.chmod(tmp_path, 0o600)
-    except BaseException:
-        # Don't leave a leftover .tmp file behind if the write itself
-        # failed partway through.
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-    os.replace(tmp_path, path)
 
 
 def _run_command(cmd: str) -> tuple[int, str]:

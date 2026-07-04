@@ -244,7 +244,13 @@ def test_get_connector_dispatches_jks(tmp_path):
     assert isinstance(connector, JksConnector)
 
 
-def test_get_connector_iis_still_not_implemented(tmp_path):
+def test_get_connector_iis_dispatch_moved_to_test_deploy_iis(tmp_path):
+    # "iis" was the last unimplemented `kind` as of Task 10; Task 11 adds
+    # `IisConnector` and its dispatch -- coverage for that now lives in
+    # `test_deploy_iis.py::test_get_connector_dispatches_iis` alongside the
+    # rest of the IIS connector's tests, rather than duplicated here.
+    from app.deploy.iis import IisConnector
+
     target = _target(tmp_path, kind="iis")
-    with pytest.raises(DeployError):
-        get_connector(target)
+    connector = get_connector(target)
+    assert isinstance(connector, IisConnector)
