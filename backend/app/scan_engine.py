@@ -124,6 +124,15 @@ def _execute(db: Session, job: ScanJob, target: Target) -> None:
     except Exception:
         log.exception("alert evaluation failed for job %s", job.id)
 
+    # Evaluate crypto-risk findings (weak keys, deprecated signatures, self-signed
+    # in prod, ...) after the job completes. Non-fatal: a findings bug must never
+    # fail a scan. Full sweep (not just this job's endpoints) mirrors evaluate_alerts.
+    from . import findings
+    try:
+        findings.evaluate_all(db)
+    except Exception:
+        log.exception("findings evaluation failed for job %s", job.id)
+
 
 def _persist_result(db, job, target, host, ip, port, sni, result):
     endpoint = _get_or_create_endpoint(db, target, host, ip, port)

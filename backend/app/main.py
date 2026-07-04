@@ -7,21 +7,24 @@ from __future__ import annotations
 
 import logging
 import os
+import pathlib
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
-from sqlalchemy import String, cast, func, or_, select
+from sqlalchemy import String, case, cast, func, or_, select
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import lifecycle, schemas, targets as target_lib
+from . import findings, lifecycle, queue, schemas, targets as target_lib
 from .alerts import dispatch_alerts, evaluate_alerts
 from .auth import require_role, router as auth_router
 from .config import settings
+from .exports import rows_to_csv
+from . import secrets as app_secrets
 from .secrets import SecretsNotConfigured, encrypt as encrypt_secret, is_encrypted
 from .db import engine, get_db, init_db, run_migrations
 from .issuers.base import IssuerError, get_adapter
@@ -29,15 +32,18 @@ from .models import (
     AcmeChallenge,
     AlertEvent,
     AuditLog,
+    Base,
     Certificate,
     CertificateObservation,
     DeploymentTarget,
     Endpoint,
+    Finding,
     Issuer,
     LifecycleOrder,
     ManagedCertificate,
     NotificationChannel,
     RenewalPolicy,
+    ReportSchedule,
     ScanJob,
     SystemSetting,
     Target,
@@ -59,6 +65,32 @@ DEFAULT_SETTINGS = {
     "app_base_url": "http://localhost:5173",
     "default_ports": [443, 8443, 9443, 636, 993, 995, 465, 587, 3389, 5986],
 }
+
+# CSV column sets for ?format=csv on the list endpoints (Phase 2, Task 1).
+# Each is a flat projection of the existing JSON item dict (cert_dict /
+# endpoint_dict / LifecycleOrderOut / _audit_dict) -- picked as the columns
+# an operator would want in a spreadsheet, dropping nested/verbose fields
+# (sans, pem, transitions, endpoint list, etc).
+CERTIFICATE_CSV_COLUMNS = [
+    "id", "common_name", "issuer_cn", "not_before", "not_after",
+    "public_key_algorithm", "public_key_size", "signature_algorithm",
+    "self_signed", "fingerprint_sha256",
+]
+ENDPOINT_CSV_COLUMNS = [
+    "id", "host", "ip", "port", "target_name", "environment", "owner",
+    "last_status", "common_name", "issuer_cn", "not_after", "days_until_expiry",
+]
+LIFECYCLE_ORDER_CSV_COLUMNS = [
+    "id", "managed_certificate_id", "action", "status", "attempts",
+    "approved_by", "approved_at", "error", "created_at", "updated_at",
+]
+AUDIT_CSV_COLUMNS = [
+    "id", "actor", "action", "entity", "entity_id", "detail", "created_at",
+]
+FINDING_CSV_COLUMNS = [
+    "id", "rule_id", "severity", "certificate_id", "endpoint_id", "title",
+    "disposition", "status", "first_seen", "last_seen",
+]
 
 
 @asynccontextmanager
@@ -305,6 +337,7 @@ def list_certificates(
     sort: str = "not_after",
     limit: int = Query(100, le=1000),
     offset: int = 0,
+    format: str = "json",
     db: Session = Depends(get_db),
 ):
     stmt = select(Certificate)
@@ -337,7 +370,12 @@ def list_certificates(
 
     order = Certificate.not_after.asc() if sort == "not_after" else Certificate.common_name.asc()
     rows = db.scalars(stmt.order_by(order).limit(limit).offset(offset)).all()
-    return {"total": total, "items": [cert_dict(db, c) for c in rows]}
+    items = [cert_dict(db, c) for c in rows]
+    if format == "csv":
+        csv_text = rows_to_csv(CERTIFICATE_CSV_COLUMNS, items)
+        return Response(content=csv_text, media_type="text/csv",
+                         headers={"Content-Disposition": 'attachment; filename="certificates.csv"'})
+    return {"total": total, "items": items}
 
 
 @app.get("/api/certificates/{cert_id}", dependencies=[Depends(require_role("viewer"))])
@@ -369,6 +407,7 @@ def list_endpoints(
     failed: bool | None = None,
     limit: int = Query(200, le=2000),
     offset: int = 0,
+    format: str = "json",
     db: Session = Depends(get_db),
 ):
     stmt = select(Endpoint)
@@ -394,7 +433,12 @@ def list_endpoints(
             stmt = stmt.where(func.lower(Target.owner).like(f"%{owner.lower()}%"))
     total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     rows = db.scalars(stmt.order_by(Endpoint.id.desc()).limit(limit).offset(offset)).all()
-    return {"total": total, "items": [endpoint_dict(db, e, with_cert=False) for e in rows]}
+    items = [endpoint_dict(db, e, with_cert=False) for e in rows]
+    if format == "csv":
+        csv_text = rows_to_csv(ENDPOINT_CSV_COLUMNS, items)
+        return Response(content=csv_text, media_type="text/csv",
+                         headers={"Content-Disposition": 'attachment; filename="endpoints.csv"'})
+    return {"total": total, "items": items}
 
 
 @app.get("/api/endpoints/{endpoint_id}", dependencies=[Depends(require_role("viewer"))])
@@ -497,6 +541,104 @@ def unmute_alert(
 @app.post("/api/alerts/evaluate", dependencies=[Depends(require_role("operator"))])
 def evaluate(db: Session = Depends(get_db)):
     return evaluate_alerts(db)
+
+
+# --------------------------------------------------------------------------- #
+# Findings (crypto-risk rules engine, Phase 2 Task 3)
+# --------------------------------------------------------------------------- #
+def finding_dict(f: Finding) -> dict:
+    return {
+        "id": f.id,
+        "rule_id": f.rule_id,
+        "severity": f.severity,
+        "certificate_id": f.certificate_id,
+        "endpoint_id": f.endpoint_id,
+        "title": f.title,
+        "detail": f.detail,
+        "dedupe_key": f.dedupe_key,
+        "disposition": f.disposition,
+        "status": f.status,
+        "first_seen": f.first_seen,
+        "last_seen": f.last_seen,
+        "created_at": f.created_at,
+        "updated_at": f.updated_at,
+    }
+
+
+@app.get("/api/findings", dependencies=[Depends(require_role("viewer"))])
+def list_findings(
+    rule_id: str = "",
+    severity: str = "",
+    disposition: str = "",
+    status: str = "active",
+    q: str = "",
+    format: str = "json",
+    limit: int = Query(100, le=1000),
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    stmt = select(Finding)
+    if rule_id:
+        stmt = stmt.where(Finding.rule_id == rule_id)
+    if severity:
+        stmt = stmt.where(Finding.severity == severity)
+    if disposition:
+        stmt = stmt.where(Finding.disposition == disposition)
+    if status:
+        stmt = stmt.where(Finding.status == status)
+    if q:
+        like = f"%{q.lower()}%"
+        stmt = stmt.where(or_(
+            func.lower(Finding.title).like(like),
+            func.lower(Finding.detail).like(like),
+        ))
+    total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    sev_rank = case({"critical": 0, "warning": 1, "info": 2}, value=Finding.severity, else_=3)
+    rows = db.scalars(
+        stmt.order_by(sev_rank.asc(), Finding.id.desc()).limit(limit).offset(offset)
+    ).all()
+    items = [finding_dict(f) for f in rows]
+    if format == "csv":
+        csv_text = rows_to_csv(FINDING_CSV_COLUMNS, items)
+        return Response(content=csv_text, media_type="text/csv",
+                         headers={"Content-Disposition": 'attachment; filename="findings.csv"'})
+    return {"total": total, "items": items}
+
+
+@app.get("/api/findings/{finding_id}", dependencies=[Depends(require_role("viewer"))])
+def get_finding(finding_id: int, db: Session = Depends(get_db)):
+    f = db.get(Finding, finding_id)
+    if not f:
+        raise HTTPException(404, "finding not found")
+    return finding_dict(f)
+
+
+@app.post("/api/findings/{finding_id}/disposition")
+def set_finding_disposition(
+    finding_id: int,
+    body: schemas.FindingDispositionIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    f = db.get(Finding, finding_id)
+    if not f:
+        raise HTTPException(404, "finding not found")
+    f.disposition = body.disposition
+    detail = f"{body.disposition}: {body.note}" if body.note else body.disposition
+    audit(db, principal["email"], "finding.disposition", "finding", f.id, detail)
+    db.commit()
+    return finding_dict(f)
+
+
+@app.post("/api/findings/evaluate")
+def evaluate_findings(
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    active = findings.evaluate_all(db)
+    audit(db, principal["email"], "finding.evaluate", "finding", "-", str(active))
+    db.commit()
+    return {"active": active}
 
 
 # --------------------------------------------------------------------------- #
@@ -886,9 +1028,14 @@ CREATABLE_ACTIONS = {"issue", "renew"}
 
 
 @app.get("/api/lifecycle/orders", dependencies=[Depends(require_role("viewer"))])
-def list_lifecycle_orders(db: Session = Depends(get_db)):
+def list_lifecycle_orders(format: str = "json", db: Session = Depends(get_db)):
     rows = db.scalars(select(LifecycleOrder).order_by(LifecycleOrder.id.desc())).all()
-    return [schemas.LifecycleOrderOut.model_validate(o).model_dump() for o in rows]
+    items = [schemas.LifecycleOrderOut.model_validate(o).model_dump() for o in rows]
+    if format == "csv":
+        csv_text = rows_to_csv(LIFECYCLE_ORDER_CSV_COLUMNS, items)
+        return Response(content=csv_text, media_type="text/csv",
+                         headers={"Content-Disposition": 'attachment; filename="lifecycle-orders.csv"'})
+    return items
 
 
 @app.get("/api/lifecycle/orders/{order_id}", dependencies=[Depends(require_role("viewer"))])
@@ -1011,6 +1158,7 @@ def list_audit(
     entity: str | None = None,
     action: str | None = None,
     since: datetime | None = None,
+    format: str = "json",
     db: Session = Depends(get_db),
 ):
     stmt = select(AuditLog)
@@ -1026,7 +1174,181 @@ def list_audit(
     rows = db.scalars(
         stmt.order_by(AuditLog.created_at.desc()).limit(limit).offset(offset)
     ).all()
-    return {"total": total, "items": [_audit_dict(r) for r in rows]}
+    items = [_audit_dict(r) for r in rows]
+    if format == "csv":
+        csv_text = rows_to_csv(AUDIT_CSV_COLUMNS, items)
+        return Response(content=csv_text, media_type="text/csv",
+                         headers={"Content-Disposition": 'attachment; filename="audit.csv"'})
+    return {"total": total, "items": items}
+
+
+# --------------------------------------------------------------------------- #
+# Restore verification (Phase 2, Task 6: backup/restore/DR)
+# --------------------------------------------------------------------------- #
+def _restore_check_secret_decrypt_ok(db: Session) -> bool:
+    """Prove the current CERTWATCH_MASTER_KEY matches the data, without ever
+    exposing plaintext or ciphertext. Always does a self round-trip; if any
+    encrypted secret exists on a NotificationChannel/Issuer, also attempts to
+    decrypt the first one found."""
+    try:
+        if app_secrets.decrypt(app_secrets.encrypt("probe")) != "probe":
+            return False
+    except SecretsNotConfigured:
+        return False
+
+    for ch in db.scalars(select(NotificationChannel)).all():
+        for v in (ch.config or {}).values():
+            if isinstance(v, str) and is_encrypted(v):
+                try:
+                    app_secrets.decrypt(v)
+                except Exception:
+                    return False
+                return True
+    for issuer in db.scalars(select(Issuer)).all():
+        for v in (issuer.config or {}).values():
+            if isinstance(v, str) and is_encrypted(v):
+                try:
+                    app_secrets.decrypt(v)
+                except Exception:
+                    return False
+                return True
+    return True
+
+
+@app.post("/api/admin/restore-check")
+def restore_check(
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("admin")),
+):
+    from alembic.config import Config
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+    from sqlalchemy import inspect
+
+    backend_dir = pathlib.Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend_dir / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend_dir / "alembic"))
+    head = ScriptDirectory.from_config(cfg).get_current_head()
+    with engine.connect() as conn:
+        current = MigrationContext.configure(conn).get_current_revision()
+
+    expected = set(Base.metadata.tables.keys())
+    present = set(inspect(engine).get_table_names())
+    tables_ok = expected.issubset(present)
+    # current is None on a fresh create_all/pre-stamp DB (SQLite tests, or a
+    # brand-new Postgres DB before run_migrations() stamps it) -- that's not
+    # a failure, only a mismatched non-null revision is.
+    schema_ok = tables_ok and (current == head or current is None)
+
+    counts = {
+        "certificates": db.scalar(select(func.count(Certificate.id))) or 0,
+        "endpoints": db.scalar(select(func.count(Endpoint.id))) or 0,
+        "managed_certificates": db.scalar(select(func.count(ManagedCertificate.id))) or 0,
+        "findings": db.scalar(select(func.count(Finding.id))) or 0,
+    }
+
+    secret_decrypt_ok = _restore_check_secret_decrypt_ok(db)
+
+    audit(db, principal["email"], "admin.restore_check", "system", "-", f"schema_ok={schema_ok}")
+    db.commit()
+    return {
+        "schema_ok": schema_ok,
+        "revision": current,
+        "head": head,
+        "counts": counts,
+        "secret_decrypt_ok": secret_decrypt_ok,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Scheduled reports (Phase 2, Task 5)
+# --------------------------------------------------------------------------- #
+def report_dict(s: ReportSchedule) -> dict:
+    return {
+        "id": s.id,
+        "name": s.name,
+        "report_type": s.report_type,
+        "filter_params": s.filter_params,
+        "format": s.format,
+        "recipients": s.recipients,
+        "channel_id": s.channel_id,
+        "cadence": s.cadence,
+        "schedule_time": s.schedule_time,
+        "schedule_day": s.schedule_day,
+        "enabled": s.enabled,
+        "last_run_at": s.last_run_at,
+        "created_at": s.created_at,
+    }
+
+
+@app.get("/api/reports", dependencies=[Depends(require_role("viewer"))])
+def list_reports(db: Session = Depends(get_db)):
+    rows = db.scalars(select(ReportSchedule).order_by(ReportSchedule.id.desc())).all()
+    return [report_dict(s) for s in rows]
+
+
+@app.post("/api/reports", status_code=201)
+def create_report(
+    body: schemas.ReportScheduleIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    if not db.get(NotificationChannel, body.channel_id):
+        raise HTTPException(400, "notification channel not found")
+    s = ReportSchedule(**body.model_dump())
+    db.add(s)
+    db.flush()
+    audit(db, principal["email"], "report.create", "report", s.id, s.name)
+    db.commit()
+    return report_dict(s)
+
+
+@app.put("/api/reports/{report_id}")
+def update_report(
+    report_id: int,
+    body: schemas.ReportScheduleIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    s = db.get(ReportSchedule, report_id)
+    if not s:
+        raise HTTPException(404, "report schedule not found")
+    if not db.get(NotificationChannel, body.channel_id):
+        raise HTTPException(400, "notification channel not found")
+    for k, v in body.model_dump().items():
+        setattr(s, k, v)
+    audit(db, principal["email"], "report.update", "report", s.id, s.name)
+    db.commit()
+    return report_dict(s)
+
+
+@app.delete("/api/reports/{report_id}", status_code=204)
+def delete_report(
+    report_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    s = db.get(ReportSchedule, report_id)
+    if not s:
+        raise HTTPException(404, "report schedule not found")
+    audit(db, principal["email"], "report.delete", "report", s.id, s.name)
+    db.delete(s)
+    db.commit()
+
+
+@app.post("/api/reports/{report_id}/run")
+def run_report(
+    report_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    s = db.get(ReportSchedule, report_id)
+    if not s:
+        raise HTTPException(404, "report schedule not found")
+    queue.enqueue(db, "report", {"schedule_id": s.id})
+    audit(db, principal["email"], "report.run", "report", s.id, s.name)
+    db.commit()
+    return {"queued": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -1096,6 +1418,17 @@ def dashboard(db: Session = Depends(get_db)):
     ) or 0
     renewal_success_rate_30d = (renew_complete_30d / renew_terminal_30d) if renew_terminal_30d else None
 
+    # --- Findings risk metrics (Task 3) ---
+    open_findings = db.scalar(
+        select(func.count(Finding.id)).where(Finding.status == "active", Finding.disposition == "open")
+    ) or 0
+    severity_rows = db.execute(
+        select(Finding.severity, func.count(Finding.id))
+        .where(Finding.status == "active", Finding.disposition == "open")
+        .group_by(Finding.severity)
+    ).all()
+    findings_by_severity = {sev: cnt for sev, cnt in severity_rows}
+
     return {
         "total_certificates": total_certs,
         "total_endpoints": total_endpoints,
@@ -1113,6 +1446,8 @@ def dashboard(db: Session = Depends(get_db)):
         "orders_in_flight": orders_in_flight,
         "orders_pending_approval": orders_pending_approval,
         "renewal_success_rate_30d": renewal_success_rate_30d,
+        "open_findings": open_findings,
+        "findings_by_severity": findings_by_severity,
     }
 
 
