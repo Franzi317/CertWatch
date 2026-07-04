@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
-from sqlalchemy import String, cast, func, or_, select
+from sqlalchemy import String, case, cast, func, or_, select
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -593,8 +593,9 @@ def list_findings(
             func.lower(Finding.detail).like(like),
         ))
     total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    sev_rank = case({"critical": 0, "warning": 1, "info": 2}, value=Finding.severity, else_=3)
     rows = db.scalars(
-        stmt.order_by(Finding.severity.asc(), Finding.id.desc()).limit(limit).offset(offset)
+        stmt.order_by(sev_rank.asc(), Finding.id.desc()).limit(limit).offset(offset)
     ).all()
     items = [finding_dict(f) for f in rows]
     if format == "csv":
@@ -623,7 +624,8 @@ def set_finding_disposition(
     if not f:
         raise HTTPException(404, "finding not found")
     f.disposition = body.disposition
-    audit(db, principal["email"], "finding.disposition", "finding", f.id, body.disposition)
+    detail = f"{body.disposition}: {body.note}" if body.note else body.disposition
+    audit(db, principal["email"], "finding.disposition", "finding", f.id, detail)
     db.commit()
     return finding_dict(f)
 

@@ -241,4 +241,22 @@ def evaluate_all(db: Session) -> int:
         if cert.id not in referenced_cert_ids:
             evaluate_certificate(db, cert, endpoint=None)
 
+    # ponytail: cross-scope reconciliation -- evaluate_certificate only clears
+    # endpoint-scoped findings for the (cert, endpoint) pair it's called with,
+    # so a rotated/deleted endpoint's stale finding for its *old* cert is
+    # never revisited above; sweep all active endpoint-scoped findings here
+    # and clear any whose (certificate_id, endpoint_id) is no longer current.
+    valid = {(ep.current_cert_id, ep.id) for ep in endpoints}
+    stale = db.scalars(
+        select(Finding).where(
+            Finding.status == "active",
+            Finding.rule_id.in_(ENDPOINT_SCOPED_RULE_IDS),
+            Finding.endpoint_id.isnot(None),
+        )
+    ).all()
+    for f in stale:
+        if (f.certificate_id, f.endpoint_id) not in valid:
+            f.status = "cleared"
+    db.commit()
+
     return db.scalar(select(func.count()).select_from(Finding).where(Finding.status == "active")) or 0

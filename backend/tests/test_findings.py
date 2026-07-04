@@ -179,6 +179,28 @@ def test_disposition_preserved_across_reevaluation(db):
     assert weak_after.status == "active"
 
 
+def test_evaluate_all_clears_endpoint_scoped_finding_on_cert_rotation(db):
+    cert_a = _cert(db, fp="ROT-A", self_signed=True)
+    t = _target(db, environment="prod")
+    ep = _endpoint(db, t, cert_a)
+    db.commit()
+
+    findings.evaluate_all(db)
+    old_key = f"self_signed_prod:{cert_a.id}:{ep.id}"
+    old = db.query(Finding).filter_by(dedupe_key=old_key).one()
+    assert old.status == "active"
+
+    cert_b = _cert(db, fp="ROT-B", self_signed=False)
+    ep.current_cert_id = cert_b.id
+    db.commit()
+
+    findings.evaluate_all(db)
+
+    old_after = db.query(Finding).filter_by(dedupe_key=old_key).one()
+    assert old_after.status == "cleared"
+    assert db.query(Finding).filter_by(status="active", dedupe_key=old_key).count() == 0
+
+
 def test_evaluate_all_counts_active_findings(db):
     c = _cert(db, public_key_algorithm="RSA", public_key_size=1024)
     t = _target(db, environment="prod")

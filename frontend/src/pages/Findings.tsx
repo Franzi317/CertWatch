@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, Finding, FindingList } from "../api";
 import { useAuth } from "../auth";
-import { SeverityBadge, fmtDate, useToast } from "../ui";
+import { SeverityBadge, useToast } from "../ui";
 
 export default function Findings() {
   const [findings, setFindings] = useState<Finding[]>([]);

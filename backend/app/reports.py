@@ -83,7 +83,7 @@ def render(db, report_type: str, filter_params: dict) -> tuple[str, str]:
         columns = FINDING_COLUMNS
     elif report_type == "endpoints":
         rows = db.scalars(select(Endpoint)).all()
-        items = [endpoint_dict(db, e) for e in rows]
+        items = [endpoint_dict(db, e, with_cert=False) for e in rows]
         columns = ENDPOINT_COLUMNS
     else:
         raise ValueError(f"unknown report_type: {report_type!r}")
