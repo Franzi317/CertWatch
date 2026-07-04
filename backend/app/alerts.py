@@ -117,6 +117,39 @@ def evaluate_alerts(db: Session, now: datetime | None = None, dispatch: bool = T
     return {"created": created, "resolved": resolved, "notified": sent}
 
 
+def raise_alert(
+    db: Session,
+    dedupe_key: str,
+    rule_type: str,
+    severity: str,
+    message: str,
+    certificate_id: int | None = None,
+    endpoint_id: int | None = None,
+) -> AlertEvent | None:
+    """Create a one-off AlertEvent for a condition that isn't part of the
+    periodic `evaluate_alerts` sweep (worker failures, stuck lifecycle
+    orders, ...), deduped by `dedupe_key` the same way `evaluate_alerts`
+    dedupes its own conditions -- one row per distinct condition, so calling
+    this repeatedly for the same still-failing condition (e.g. a worker
+    retrying the same order) never spams duplicate rows. `dispatch_alerts`
+    picks the new row up on its normal cadence like any other alert; no new
+    alert infrastructure. Returns the created AlertEvent, or None if one
+    already existed (dedup fired -- condition already recorded)."""
+    if db.scalar(select(AlertEvent).where(AlertEvent.dedupe_key == dedupe_key)):
+        return None
+    ev = AlertEvent(
+        dedupe_key=dedupe_key,
+        certificate_id=certificate_id,
+        endpoint_id=endpoint_id,
+        rule_type=rule_type,
+        severity=severity,
+        message=message,
+    )
+    db.add(ev)
+    db.commit()
+    return ev
+
+
 def record_change_alert(db: Session, endpoint: Endpoint, cert: Certificate) -> None:
     """Called when an endpoint's cert fingerprint changes between scans."""
     key = f"changed:{endpoint.id}:{cert.id}"

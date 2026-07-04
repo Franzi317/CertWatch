@@ -162,7 +162,8 @@ class AlertEvent(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     endpoint_id: Mapped[int | None] = mapped_column(ForeignKey("endpoints.id"))
     certificate_id: Mapped[int | None] = mapped_column(ForeignKey("certificates.id"))
-    # rule_type: expiring | expired | changed | scan_failure | self_signed
+    # rule_type: expiring | expired | changed | scan_failure | self_signed |
+    #            renewal_failed | deploy_failed | order_stuck (Task 13)
     rule_type: Mapped[str] = mapped_column(String(32))
     threshold_days: Mapped[int | None] = mapped_column(Integer)
     severity: Mapped[str] = mapped_column(String(16), default="info")  # info|warning|critical

@@ -58,6 +58,23 @@ export default function Dashboard() {
               <StatCard label="Failed scans" value={d.failed_scans} severity={d.failed_scans ? "warning" : "healthy"} />
               <StatCard label="Recently changed (7d)" value={d.recently_changed} />
               <StatCard label="Open alerts" value={d.open_alerts} severity={d.open_alerts ? "warning" : "healthy"} />
+              <StatCard label="Managed certificates" value={d.managed_certificates} severity="info" />
+              <StatCard label="Unmanaged certificates" value={d.unmanaged_certificates} />
+              <StatCard label="Orders in flight" value={d.orders_in_flight} severity={d.orders_in_flight ? "info" : "healthy"} />
+              <StatCard
+                label="Pending approval"
+                value={d.orders_pending_approval}
+                severity={d.orders_pending_approval ? "warning" : "healthy"}
+              />
+              <StatCard
+                label="Renewal success (30d)"
+                value={d.renewal_success_rate_30d == null ? "—" : `${Math.round(d.renewal_success_rate_30d * 100)}%`}
+                severity={
+                  d.renewal_success_rate_30d == null ? undefined
+                    : d.renewal_success_rate_30d >= 0.9 ? "healthy"
+                    : d.renewal_success_rate_30d >= 0.5 ? "warning" : "critical"
+                }
+              />
             </div>
 
             <div className="panel" style={{ marginTop: 20 }}>

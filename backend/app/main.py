@@ -31,6 +31,7 @@ from .models import (
     AuditLog,
     Certificate,
     CertificateObservation,
+    DeploymentTarget,
     Endpoint,
     Issuer,
     LifecycleOrder,
@@ -846,6 +847,31 @@ def promote_certificate(
     return _managed_cert_out(db, m)
 
 
+@app.get(
+    "/api/managed-certificates/{managed_id}/deployment-targets",
+    dependencies=[Depends(require_role("viewer"))],
+)
+def list_deployment_targets_for_managed_cert(managed_id: int, db: Session = Depends(get_db)):
+    """Read-only summary for the ManagedCerts detail view -- deliberately
+    omits `config` (may hold keystore/PFX passwords or WinRM credentials,
+    see DeploymentTarget's docstring) since there's no UI need to display it
+    here, unlike Issuer.config which has an established scrub-and-mark
+    convention (`_issuer_out`)."""
+    if not db.get(ManagedCertificate, managed_id):
+        raise HTTPException(404, "managed certificate not found")
+    rows = db.scalars(
+        select(DeploymentTarget).where(DeploymentTarget.managed_certificate_id == managed_id)
+    ).all()
+    return [
+        {
+            "id": t.id, "name": t.name, "kind": t.kind, "enabled": t.enabled,
+            "last_deploy_at": t.last_deploy_at, "last_deploy_ok": t.last_deploy_ok,
+            "managed_certificate_id": t.managed_certificate_id,
+        }
+        for t in rows
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # Lifecycle orders (Task 7): approval-gated issue/renew/revoke state machine
 # --------------------------------------------------------------------------- #
@@ -1023,6 +1049,44 @@ def dashboard(db: Session = Depends(get_db)):
         if next_scan is None or nxt < next_scan:
             next_scan = nxt
 
+    # --- Lifecycle management metrics (Task 13) ---
+    managed_certificates = db.scalar(select(func.count(ManagedCertificate.id))) or 0
+    # "unmanaged" = observed Certificate rows that no ManagedCertificate
+    # currently points to via current_certificate_id (a cert can only ever
+    # be "current" for at most one ManagedCertificate).
+    managed_cert_fk_ids = select(ManagedCertificate.current_certificate_id).where(
+        ManagedCertificate.current_certificate_id.is_not(None)
+    )
+    unmanaged_certificates = db.scalar(
+        select(func.count(Certificate.id)).where(Certificate.id.notin_(managed_cert_fk_ids))
+    ) or 0
+
+    orders_in_flight = db.scalar(
+        select(func.count(LifecycleOrder.id)).where(
+            LifecycleOrder.status.notin_(list(lifecycle.TERMINAL_STATES))
+        )
+    ) or 0
+    orders_pending_approval = db.scalar(
+        select(func.count(LifecycleOrder.id)).where(LifecycleOrder.status == "pending_approval")
+    ) or 0
+
+    since_30d = now - timedelta(days=30)
+    renew_terminal_30d = db.scalar(
+        select(func.count(LifecycleOrder.id)).where(
+            LifecycleOrder.action == "renew",
+            LifecycleOrder.status.in_(list(lifecycle.TERMINAL_STATES)),
+            LifecycleOrder.updated_at >= since_30d,
+        )
+    ) or 0
+    renew_complete_30d = db.scalar(
+        select(func.count(LifecycleOrder.id)).where(
+            LifecycleOrder.action == "renew",
+            LifecycleOrder.status == "complete",
+            LifecycleOrder.updated_at >= since_30d,
+        )
+    ) or 0
+    renewal_success_rate_30d = (renew_complete_30d / renew_terminal_30d) if renew_terminal_30d else None
+
     return {
         "total_certificates": total_certs,
         "total_endpoints": total_endpoints,
@@ -1035,6 +1099,11 @@ def dashboard(db: Session = Depends(get_db)):
         "open_alerts": open_alerts,
         "last_successful_scan": last_ok,
         "next_scheduled_scan": next_scan,
+        "managed_certificates": managed_certificates,
+        "unmanaged_certificates": unmanaged_certificates,
+        "orders_in_flight": orders_in_flight,
+        "orders_pending_approval": orders_pending_approval,
+        "renewal_success_rate_30d": renewal_success_rate_30d,
     }
 
 

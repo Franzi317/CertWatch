@@ -13,13 +13,19 @@ from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import select
 
-from . import lifecycle, queue
+from . import alerts, lifecycle, queue
 from .config import settings
 from .db import SessionLocal
-from .models import Certificate, ManagedCertificate, RenewalPolicy, ScanJob, Target, utcnow
+from .models import Certificate, LifecycleOrder, ManagedCertificate, RenewalPolicy, ScanJob, Target, utcnow
 
 log = logging.getLogger("certwatch.scheduler")
 _scheduler: BackgroundScheduler | None = None
+
+# Task 13: how long a LifecycleOrder may sit in a non-terminal state (e.g.
+# "issuing"/"deploying") before order_stuck_tick treats it as abandoned --
+# most plausibly a worker crash mid-order, since every legitimate step
+# either advances the order or fails it closed within seconds.
+ORDER_STUCK_THRESHOLD = timedelta(hours=2)
 
 
 def enqueue_scan(db, target: Target, trigger: str = "manual") -> ScanJob:
@@ -140,6 +146,43 @@ def renewal_tick() -> None:
         db.close()
 
 
+def order_stuck_tick() -> None:
+    """Task 13: find every LifecycleOrder in a non-terminal state whose
+    `updated_at` is older than ORDER_STUCK_THRESHOLD and raise an
+    `order_stuck` AlertEvent for it (deduped per order via
+    `alerts.raise_alert`, so re-running this tick every few minutes doesn't
+    spam). This is the safety net for a worker crash mid-issuance/deploy: the
+    order would otherwise sit in e.g. "issuing" forever with nothing else
+    watching it."""
+    db = SessionLocal()
+    try:
+        now = utcnow()
+        open_orders = db.scalars(
+            select(LifecycleOrder).where(LifecycleOrder.status.notin_(list(lifecycle.TERMINAL_STATES)))
+        ).all()
+        for order in open_orders:
+            if now - _aware(order.updated_at) < ORDER_STUCK_THRESHOLD:
+                continue
+            managed = db.get(ManagedCertificate, order.managed_certificate_id)
+            cn = managed.common_name if managed else str(order.managed_certificate_id)
+            alerts.raise_alert(
+                db,
+                dedupe_key=f"order_stuck:{order.id}",
+                rule_type="order_stuck",
+                severity="warning",
+                message=(
+                    f"Lifecycle order {order.id} ({order.action}) for {cn} has been stuck in "
+                    f"'{order.status}' since {order.updated_at.isoformat()} -- possible worker "
+                    "crash or hang; investigate the queue and worker logs."
+                ),
+                certificate_id=managed.current_certificate_id if managed else None,
+            )
+    except Exception:
+        log.exception("order_stuck tick failed")
+    finally:
+        db.close()
+
+
 def start_scheduler() -> None:
     global _scheduler
     if _scheduler is not None:
@@ -147,6 +190,7 @@ def start_scheduler() -> None:
     _scheduler = BackgroundScheduler(daemon=True)
     _scheduler.add_job(_tick, "interval", minutes=1, id="scan_tick", max_instances=1)
     _scheduler.add_job(renewal_tick, "interval", hours=24, id="renewal_tick", max_instances=1)
+    _scheduler.add_job(order_stuck_tick, "interval", minutes=5, id="order_stuck_tick", max_instances=1)
     _scheduler.start()
     log.info("scheduler started")
 

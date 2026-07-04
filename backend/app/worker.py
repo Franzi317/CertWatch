@@ -26,13 +26,12 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from sqlalchemy import select
 
-from . import lifecycle, queue, scan_engine, secrets
+from . import alerts, lifecycle, queue, scan_engine, secrets
 from .crypto_keys import build_csr, generate_private_key
 from .db import SessionLocal
 from .deploy.base import CertBundle, DeployError, DeployResult, get_connector
 from .issuers.base import get_adapter
 from .models import (
-    AlertEvent,
     Certificate,
     DeploymentTarget,
     Endpoint,
@@ -143,6 +142,10 @@ def _process_issuance(db, item) -> None:
         if managed is not None:
             managed.state = "error"
             db.commit()
+            _raise_order_alert(
+                db, managed, order, "renewal_failed",
+                f"Issuance failed for {managed.common_name or managed.id}: {e}",
+            )
         queue.fail(db, item, str(e))
     else:
         queue.complete(db, item)
@@ -228,6 +231,10 @@ def _process_deploy(db, item) -> None:
         if managed is not None:
             managed.state = "error"
             db.commit()
+            _raise_order_alert(
+                db, managed, order, "deploy_failed",
+                f"Deployment failed for {managed.common_name or managed.id}: {e}",
+            )
         queue.fail(db, item, str(e))
     else:
         queue.complete(db, item)
@@ -309,7 +316,11 @@ def _process_verify(db, item) -> None:
         lifecycle.transition(db, order, "failed", "post-deploy verification mismatch")
         managed.state = "error"
         db.commit()
-        _raise_deploy_failed_alert(db, managed, order)
+        _raise_order_alert(
+            db, managed, order, "deploy_failed",
+            f"Post-deploy verification failed for {managed.common_name or managed.id}: "
+            "the certificate observed live does not match the newly issued certificate.",
+        )
         queue.fail(db, item, "post-deploy verification mismatch")
 
 
@@ -351,26 +362,22 @@ def _verify_endpoints_serve(endpoints: list[Endpoint], expected_fingerprint: str
     return True
 
 
-def _raise_deploy_failed_alert(db, managed: ManagedCertificate, order) -> None:
-    """Reuses the AlertEvent/dedupe_key pattern from `app.alerts` (one row
-    per distinct condition, keyed so re-running verify on the same failed
-    order doesn't spam duplicate events) rather than reinventing dispatch --
-    `alerts.dispatch_alerts`/`evaluate_alerts` pick this event up on their
-    normal cadence like any other."""
-    key = f"deploy_failed:{order.id}"
-    if db.scalar(select(AlertEvent).where(AlertEvent.dedupe_key == key)):
-        return
-    db.add(AlertEvent(
-        dedupe_key=key,
-        certificate_id=managed.current_certificate_id,
-        rule_type="deploy_failed",
+def _raise_order_alert(db, managed: ManagedCertificate, order, rule_type: str, message: str) -> None:
+    """Reuses `alerts.raise_alert` (one AlertEvent row per distinct
+    dedupe_key, keyed per-order so re-running the same failed order doesn't
+    spam duplicate events) rather than reinventing dispatch --
+    `alerts.dispatch_alerts`/`evaluate_alerts` pick the row up on their
+    normal cadence like any other. Used for both `deploy_failed` (post-deploy
+    verification mismatch, Task 12; deployment connector failure, Task 13)
+    and `renewal_failed` (issuance failure, Task 13)."""
+    alerts.raise_alert(
+        db,
+        dedupe_key=f"{rule_type}:{order.id}",
+        rule_type=rule_type,
         severity="critical",
-        message=(
-            f"Post-deploy verification failed for {managed.common_name or managed.id}: "
-            "the certificate observed live does not match the newly issued certificate."
-        ),
-    ))
-    db.commit()
+        message=message,
+        certificate_id=managed.current_certificate_id,
+    )
 
 
 def _split_leaf_and_chain(pem_blob: str) -> tuple[str, str]:
