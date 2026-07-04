@@ -90,8 +90,35 @@ export interface Channel {
   id: number; name: string; channel_type: string; enabled: boolean; re_alert_hours: number;
   config_summary: Record<string, any>;
 }
+export interface Issuer {
+  id: number; name: string; issuer_type: string; enabled: boolean;
+  last_test_at: string | null; last_test_ok: boolean; created_at: string;
+  config: Record<string, any>;
+}
 export interface Dashboard {
   total_certificates: number; total_endpoints: number; expiring_90d: number; expiring_30d: number;
   expiring_7d: number; expired: number; failed_scans: number; recently_changed: number;
   open_alerts: number; last_successful_scan: string | null; next_scheduled_scan: string | null;
+  managed_certificates: number; unmanaged_certificates: number; orders_in_flight: number;
+  orders_pending_approval: number; renewal_success_rate_30d: number | null;
+}
+export interface RenewalPolicy {
+  id: number; name: string; renew_before_days: number; key_algorithm: string; key_size: number;
+  require_approval: boolean; verify_after_deploy: boolean; max_retries: number; created_at: string;
+}
+export interface ManagedCertificate {
+  id: number; common_name: string; sans: string[]; issuer_id: number; renewal_policy_id: number;
+  current_certificate_id: number | null; state: string; owner: string; environment: string;
+  created_at: string; updated_at: string;
+  current_cert_common_name?: string | null; current_cert_not_after?: string | null;
+}
+export interface DeploymentTargetSummary {
+  id: number; name: string; kind: string; enabled: boolean;
+  last_deploy_at: string | null; last_deploy_ok: boolean; managed_certificate_id: number;
+}
+export interface LifecycleTransition { from: string; to: string; at: string; detail: string; }
+export interface LifecycleOrder {
+  id: number; managed_certificate_id: number; action: string; status: string; attempts: number;
+  approved_by: string; approved_at: string | null; error: string; correlation_id: string;
+  transitions: LifecycleTransition[]; created_at: string; updated_at: string;
 }

@@ -23,6 +23,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -162,7 +163,8 @@ class AlertEvent(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     endpoint_id: Mapped[int | None] = mapped_column(ForeignKey("endpoints.id"))
     certificate_id: Mapped[int | None] = mapped_column(ForeignKey("certificates.id"))
-    # rule_type: expiring | expired | changed | scan_failure | self_signed
+    # rule_type: expiring | expired | changed | scan_failure | self_signed |
+    #            renewal_failed | deploy_failed | order_stuck (Task 13)
     rule_type: Mapped[str] = mapped_column(String(32))
     threshold_days: Mapped[int | None] = mapped_column(Integer)
     severity: Mapped[str] = mapped_column(String(16), default="info")  # info|warning|critical
@@ -238,6 +240,156 @@ class WorkQueue(Base):
     last_error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class Issuer(Base):
+    """A configured CA (AD CS or ACME) that certificate requests are issued
+    against. `config` holds non-secret adapter fields plus secret fields the
+    adapter encrypts/decrypts via `app.secrets` before use."""
+
+    __tablename__ = "issuers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    # issuer_type: adcs | acme
+    issuer_type: Mapped[str] = mapped_column(String(16))
+    config: Mapped[dict] = mapped_column(JSON, default=dict)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_test_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_test_ok: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class RenewalPolicy(Base):
+    """Rules governing how a ManagedCertificate is renewed: lead time, key
+    material for the new cert, whether a human must approve before issuance,
+    and post-deploy verification/retry behavior."""
+
+    __tablename__ = "renewal_policies"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    renew_before_days: Mapped[int] = mapped_column(Integer, default=30)
+    key_algorithm: Mapped[str] = mapped_column(String(16), default="rsa")
+    key_size: Mapped[int] = mapped_column(Integer, default=2048)
+    require_approval: Mapped[bool] = mapped_column(Boolean, default=True)
+    verify_after_deploy: Mapped[bool] = mapped_column(Boolean, default=True)
+    max_retries: Mapped[int] = mapped_column(Integer, default=3)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ManagedCertificate(Base):
+    """A lifecycle-managed certificate: created directly or by promoting an
+    observed inventory `Certificate` (see `/api/certificates/{id}/manage` in
+    main.py). References the observed cert via `current_certificate_id`
+    rather than merging into it -- the inventory table stays the deduped
+    scan artifact; this table is the operator-facing management record."""
+
+    __tablename__ = "managed_certificates"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    common_name: Mapped[str] = mapped_column(String(255), default="")
+    sans: Mapped[list] = mapped_column(JSON, default=list)
+    issuer_id: Mapped[int] = mapped_column(ForeignKey("issuers.id"))
+    renewal_policy_id: Mapped[int] = mapped_column(ForeignKey("renewal_policies.id"))
+    current_certificate_id: Mapped[int | None] = mapped_column(ForeignKey("certificates.id"))
+    # Encrypted (app.secrets) PEM of the private key for current_certificate_id,
+    # generated at issuance time (migration 0011). Needed by deployment (Task 9)
+    # to build the PFX/PEM bundle -- never stored in plaintext.
+    current_key_ref: Mapped[str] = mapped_column(Text, default="")
+    # state: active | renewing | error | retired (validated in the app layer, not the DB)
+    state: Mapped[str] = mapped_column(String(16), default="active")
+    owner: Mapped[str] = mapped_column(String(255), default="")
+    environment: Mapped[str] = mapped_column(String(64), default="prod")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class LifecycleOrder(Base):
+    """A single issue/renew/revoke operation on a ManagedCertificate, driven
+    through an approval-gated state machine (see `app.lifecycle`). Renewals
+    are approval-gated by project decision; revoke requires admin approval
+    (two-person rule) -- both enforced in `lifecycle.approve`, not here.
+
+    `transitions` is an append-only audit trail of every status change:
+    a list of `{"from", "to", "at", "detail"}` dicts."""
+
+    __tablename__ = "lifecycle_orders"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    managed_certificate_id: Mapped[int] = mapped_column(ForeignKey("managed_certificates.id"))
+    # action: issue | renew | revoke
+    action: Mapped[str] = mapped_column(String(8))
+    # status: pending_approval | approved | queued | issuing | deploying |
+    #         verifying | complete | failed | rolled_back (validated in the
+    #         app layer via lifecycle.ALLOWED_TRANSITIONS, not the DB)
+    status: Mapped[str] = mapped_column(String(20), default="pending_approval")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    approved_by: Mapped[str] = mapped_column(String(255), default="")
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error: Mapped[str] = mapped_column(Text, default="")
+    correlation_id: Mapped[str] = mapped_column(String(36), default="")
+    transitions: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    # Partial unique index (matches migration 0010_open_order_unique_index
+    # exactly): at most one OPEN (non-terminal) order per
+    # (managed_certificate_id, action). This is what makes
+    # lifecycle.create_order's idempotency race-safe -- declared here too so
+    # SQLite dev/test DBs built via Base.metadata.create_all() get the same
+    # guarantee as Postgres via the Alembic migration.
+    __table_args__ = (
+        Index(
+            "uq_open_lifecycle_order",
+            "managed_certificate_id", "action",
+            unique=True,
+            sqlite_where=text("status NOT IN ('complete','failed','rolled_back')"),
+            postgresql_where=text("status NOT IN ('complete','failed','rolled_back')"),
+        ),
+    )
+
+
+class DeploymentTarget(Base):
+    """Where a ManagedCertificate's renewed material gets pushed once an
+    order reaches `deploying` (Task 9). `kind` selects the connector
+    (`app.deploy.get_connector`): `pem` writes plain PEM files to disk (this
+    task); `pfx`/`jks`/`iis` (Tasks 10/11) build a PKCS12 keystore, a Java
+    keystore, or push into IIS's certificate store, respectively.
+
+    `config` holds connector-specific fields -- filesystem paths for `pem`,
+    keystore path + password for `pfx`/`jks`, host/credential for `iis` --
+    and MUST run secret fields (keystore/PFX passwords, WinRM creds) through
+    `app.secrets` before storing them here, same convention as Issuer.config.
+    """
+
+    __tablename__ = "deployment_targets"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    # kind: pem | pfx | jks | iis (validated in the app layer, not the DB --
+    # same convention as Issuer.issuer_type / ManagedCertificate.state)
+    kind: Mapped[str] = mapped_column(String(8))
+    config: Mapped[dict] = mapped_column(JSON, default=dict)
+    post_deploy_command: Mapped[str] = mapped_column(Text, default="")
+    managed_certificate_id: Mapped[int] = mapped_column(ForeignKey("managed_certificates.id"))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_deploy_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_deploy_ok: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AcmeChallenge(Base):
+    """Pending ACME HTTP-01 challenges. The public `/.well-known/acme-challenge/{token}`
+    route (main.py) serves `key_authorization` for a row here; the ACME adapter
+    inserts a row before answering each challenge and deletes it (best-effort)
+    once the order finalizes."""
+
+    __tablename__ = "acme_challenges"
+
+    token: Mapped[str] = mapped_column(String(255), primary_key=True)
+    key_authorization: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class AuditLog(Base):

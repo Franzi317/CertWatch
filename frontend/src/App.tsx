@@ -8,6 +8,9 @@ import Endpoints from "./pages/Endpoints";
 import EndpointDetail from "./pages/EndpointDetail";
 import ScanJobs from "./pages/ScanJobs";
 import Alerts from "./pages/Alerts";
+import Issuers from "./pages/Issuers";
+import ManagedCerts from "./pages/ManagedCerts";
+import Orders from "./pages/Orders";
 import Settings from "./pages/Settings";
 import Login from "./pages/Login";
 import { AuthProvider, RequireAuth, useAuth } from "./auth";
@@ -20,6 +23,9 @@ const nav = [
   ["/endpoints", "Endpoints"],
   ["/scans", "Scan Jobs"],
   ["/alerts", "Alerts"],
+  ["/issuers", "Issuers"],
+  ["/managed-certificates", "Managed Certs"],
+  ["/orders", "Orders"],
   ["/settings", "Settings"],
 ];
 
@@ -92,6 +98,9 @@ function AppShell() {
           <Route path="/endpoints/:id" element={<EndpointDetail />} />
           <Route path="/scans" element={<ScanJobs />} />
           <Route path="/alerts" element={<Alerts />} />
+          <Route path="/issuers" element={<Issuers />} />
+          <Route path="/managed-certificates" element={<ManagedCerts />} />
+          <Route path="/orders" element={<Orders />} />
           <Route path="/settings" element={<Settings />} />
         </Routes>
       </main>

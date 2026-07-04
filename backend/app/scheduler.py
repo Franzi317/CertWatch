@@ -13,13 +13,19 @@ from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import select
 
-from . import queue
+from . import alerts, lifecycle, queue
 from .config import settings
 from .db import SessionLocal
-from .models import ScanJob, Target, utcnow
+from .models import Certificate, LifecycleOrder, ManagedCertificate, RenewalPolicy, ScanJob, Target, utcnow
 
 log = logging.getLogger("certwatch.scheduler")
 _scheduler: BackgroundScheduler | None = None
+
+# Task 13: how long a LifecycleOrder may sit in a non-terminal state (e.g.
+# "issuing"/"deploying") before order_stuck_tick treats it as abandoned --
+# most plausibly a worker crash mid-order, since every legitimate step
+# either advances the order or fails it closed within seconds.
+ORDER_STUCK_THRESHOLD = timedelta(hours=2)
 
 
 def enqueue_scan(db, target: Target, trigger: str = "manual") -> ScanJob:
@@ -107,12 +113,84 @@ def _aware(dt):
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
+def renewal_tick() -> None:
+    """Daily job (Task 8): find every ManagedCertificate whose current
+    certificate is within its RenewalPolicy's renew_before_days window and
+    open a "renew" LifecycleOrder for it. Approval-gated by project decision
+    -- this NEVER auto-approves, it only creates the pending_approval order
+    (`lifecycle.create_order` is idempotent, so re-running this tick is safe:
+    an already-open renew order for the same managed cert is reused, not
+    duplicated -- see migration 0010's partial unique index)."""
+    db = SessionLocal()
+    try:
+        now = utcnow()
+        managed_certs = db.scalars(
+            select(ManagedCertificate).where(ManagedCertificate.state == "active")
+        ).all()
+        for managed in managed_certs:
+            if managed.current_certificate_id is None:
+                continue
+            cert = db.get(Certificate, managed.current_certificate_id)
+            if cert is None or cert.not_after is None:
+                continue
+            policy = db.get(RenewalPolicy, managed.renewal_policy_id)
+            if policy is None:
+                continue
+            not_after = _aware(cert.not_after)
+            if not_after - now <= timedelta(days=policy.renew_before_days):
+                lifecycle.create_order(db, managed, "renew", actor="system")
+                log.info("renewal order opened for managed certificate %s", managed.id)
+    except Exception:
+        log.exception("renewal tick failed")
+    finally:
+        db.close()
+
+
+def order_stuck_tick() -> None:
+    """Task 13: find every LifecycleOrder in a non-terminal state whose
+    `updated_at` is older than ORDER_STUCK_THRESHOLD and raise an
+    `order_stuck` AlertEvent for it (deduped per order via
+    `alerts.raise_alert`, so re-running this tick every few minutes doesn't
+    spam). This is the safety net for a worker crash mid-issuance/deploy: the
+    order would otherwise sit in e.g. "issuing" forever with nothing else
+    watching it."""
+    db = SessionLocal()
+    try:
+        now = utcnow()
+        open_orders = db.scalars(
+            select(LifecycleOrder).where(LifecycleOrder.status.notin_(list(lifecycle.TERMINAL_STATES)))
+        ).all()
+        for order in open_orders:
+            if now - _aware(order.updated_at) < ORDER_STUCK_THRESHOLD:
+                continue
+            managed = db.get(ManagedCertificate, order.managed_certificate_id)
+            cn = managed.common_name if managed else str(order.managed_certificate_id)
+            alerts.raise_alert(
+                db,
+                dedupe_key=f"order_stuck:{order.id}",
+                rule_type="order_stuck",
+                severity="warning",
+                message=(
+                    f"Lifecycle order {order.id} ({order.action}) for {cn} has been stuck in "
+                    f"'{order.status}' since {order.updated_at.isoformat()} -- possible worker "
+                    "crash or hang; investigate the queue and worker logs."
+                ),
+                certificate_id=managed.current_certificate_id if managed else None,
+            )
+    except Exception:
+        log.exception("order_stuck tick failed")
+    finally:
+        db.close()
+
+
 def start_scheduler() -> None:
     global _scheduler
     if _scheduler is not None:
         return
     _scheduler = BackgroundScheduler(daemon=True)
     _scheduler.add_job(_tick, "interval", minutes=1, id="scan_tick", max_instances=1)
+    _scheduler.add_job(renewal_tick, "interval", hours=24, id="renewal_tick", max_instances=1)
+    _scheduler.add_job(order_stuck_tick, "interval", minutes=5, id="order_stuck_tick", max_instances=1)
     _scheduler.start()
     log.info("scheduler started")
 

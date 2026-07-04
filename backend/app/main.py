@@ -13,24 +13,31 @@ from datetime import datetime, timedelta
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import schemas, targets as target_lib
+from . import lifecycle, schemas, targets as target_lib
 from .alerts import dispatch_alerts, evaluate_alerts
 from .auth import require_role, router as auth_router
 from .config import settings
 from .secrets import SecretsNotConfigured, encrypt as encrypt_secret, is_encrypted
 from .db import engine, get_db, init_db, run_migrations
+from .issuers.base import IssuerError, get_adapter
 from .models import (
+    AcmeChallenge,
     AlertEvent,
     AuditLog,
     Certificate,
     CertificateObservation,
+    DeploymentTarget,
     Endpoint,
+    Issuer,
+    LifecycleOrder,
+    ManagedCertificate,
     NotificationChannel,
+    RenewalPolicy,
     ScanJob,
     SystemSetting,
     Target,
@@ -609,6 +616,348 @@ def test_channel(channel_id: int, db: Session = Depends(get_db)):
 
 
 # --------------------------------------------------------------------------- #
+# Issuers (CA integrations: AD CS, ACME)
+# --------------------------------------------------------------------------- #
+# Which config keys are secret, per issuer type. Everything else in `config`
+# is considered non-sensitive and echoed back as-is (e.g. contact_email).
+_ISSUER_SECRET_KEYS = {
+    "adcs": {"username", "password"},
+    "acme": {"account_key_pem"},
+}
+
+
+def _encrypt_issuer_secrets(issuer_type: str, config: dict) -> dict:
+    """Encrypt secret-shaped values for this issuer type that aren't already
+    encrypted. Raises SecretsNotConfigured (via app.secrets.encrypt) if
+    CERTWATCH_MASTER_KEY isn't set and a plaintext secret needs encrypting."""
+    secret_keys = _ISSUER_SECRET_KEYS.get(issuer_type, set())
+    out = dict(config or {})
+    for k in secret_keys:
+        v = out.get(k)
+        if v and not is_encrypted(v):
+            out[k] = encrypt_secret(v)
+    return out
+
+
+def _issuer_out(issuer: Issuer) -> dict:
+    secret_keys = _ISSUER_SECRET_KEYS.get(issuer.issuer_type, set())
+    config = issuer.config or {}
+    summary = {k: v for k, v in config.items() if k not in secret_keys}
+    for k in secret_keys:
+        if k in config:
+            summary[f"{k}_set"] = bool(config.get(k))
+    return {
+        "id": issuer.id,
+        "name": issuer.name,
+        "issuer_type": issuer.issuer_type,
+        "enabled": issuer.enabled,
+        "last_test_at": issuer.last_test_at,
+        "last_test_ok": issuer.last_test_ok,
+        "created_at": issuer.created_at,
+        "config": summary,
+    }
+
+
+@app.get("/api/issuers", dependencies=[Depends(require_role("viewer"))])
+def list_issuers(db: Session = Depends(get_db)):
+    return [_issuer_out(i) for i in db.scalars(select(Issuer)).all()]
+
+
+@app.post("/api/issuers", status_code=201)
+def create_issuer(
+    body: schemas.IssuerIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("admin")),
+):
+    data = body.model_dump()
+    if data["issuer_type"] not in _ISSUER_SECRET_KEYS:
+        raise HTTPException(400, "unknown issuer type")
+    try:
+        data["config"] = _encrypt_issuer_secrets(data["issuer_type"], data.get("config") or {})
+    except SecretsNotConfigured as e:
+        raise HTTPException(400, str(e))
+    issuer = Issuer(**data)
+    db.add(issuer)
+    db.flush()
+    audit(db, principal["email"], "issuer.create", "issuer", issuer.id, issuer.name)
+    db.commit()
+    return _issuer_out(issuer)
+
+
+@app.put("/api/issuers/{issuer_id}")
+def update_issuer(
+    issuer_id: int,
+    body: schemas.IssuerIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("admin")),
+):
+    issuer = db.get(Issuer, issuer_id)
+    if not issuer:
+        raise HTTPException(404, "issuer not found")
+    if body.issuer_type != issuer.issuer_type:
+        raise HTTPException(400, "cannot change issuer type")
+    if body.issuer_type not in _ISSUER_SECRET_KEYS:
+        raise HTTPException(400, "unknown issuer type")
+    secret_keys = _ISSUER_SECRET_KEYS.get(body.issuer_type, set())
+    # Merge config so a blank secret field doesn't wipe an existing one.
+    new_config = dict(issuer.config or {})
+    for k, v in (body.config or {}).items():
+        if k in secret_keys and v == "":
+            continue  # keep existing secret
+        new_config[k] = v
+    try:
+        new_config = _encrypt_issuer_secrets(body.issuer_type, new_config)
+    except SecretsNotConfigured as e:
+        raise HTTPException(400, str(e))
+    issuer.name, issuer.enabled = body.name, body.enabled
+    issuer.config = new_config
+    audit(db, principal["email"], "issuer.update", "issuer", issuer.id, issuer.name)
+    db.commit()
+    return _issuer_out(issuer)
+
+
+@app.delete("/api/issuers/{issuer_id}", status_code=204)
+def delete_issuer(
+    issuer_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("admin")),
+):
+    issuer = db.get(Issuer, issuer_id)
+    if not issuer:
+        raise HTTPException(404, "issuer not found")
+    audit(db, principal["email"], "issuer.delete", "issuer", issuer.id, issuer.name)
+    db.delete(issuer)
+    db.commit()
+
+
+@app.post("/api/issuers/{issuer_id}/test")
+def test_issuer(
+    issuer_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    issuer = db.get(Issuer, issuer_id)
+    if not issuer:
+        raise HTTPException(404, "issuer not found")
+    ok = True
+    detail = "connection ok"
+    try:
+        get_adapter(issuer).test_connection()
+    except IssuerError as e:
+        ok = False
+        detail = str(e)
+    issuer.last_test_at = utcnow()
+    issuer.last_test_ok = ok
+    audit(db, principal["email"], "issuer.test", "issuer", issuer.id, detail)
+    db.commit()
+    return {"ok": ok, "detail": detail}
+
+
+# --------------------------------------------------------------------------- #
+# Renewal policies + managed certificates (lifecycle management, Phase 1)
+# --------------------------------------------------------------------------- #
+@app.get("/api/renewal-policies", dependencies=[Depends(require_role("viewer"))])
+def list_renewal_policies(db: Session = Depends(get_db)):
+    rows = db.scalars(select(RenewalPolicy)).all()
+    return [schemas.RenewalPolicyOut.model_validate(p).model_dump() for p in rows]
+
+
+@app.post("/api/renewal-policies", status_code=201)
+def create_renewal_policy(
+    body: schemas.RenewalPolicyIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    policy = RenewalPolicy(**body.model_dump())
+    db.add(policy)
+    db.flush()
+    audit(db, principal["email"], "renewal_policy.create", "renewal_policy", policy.id, policy.name)
+    db.commit()
+    return schemas.RenewalPolicyOut.model_validate(policy).model_dump()
+
+
+def _managed_cert_out(db: Session, m: ManagedCertificate) -> dict:
+    out = schemas.ManagedCertificateOut.model_validate(m).model_dump()
+    if m.current_certificate_id:
+        cert = db.get(Certificate, m.current_certificate_id)
+        if cert:
+            out["current_cert_common_name"] = cert.common_name
+            out["current_cert_not_after"] = cert.not_after
+    return out
+
+
+def _require_issuer_and_policy(db: Session, issuer_id: int, renewal_policy_id: int) -> None:
+    if not db.get(Issuer, issuer_id):
+        raise HTTPException(400, "issuer not found")
+    if not db.get(RenewalPolicy, renewal_policy_id):
+        raise HTTPException(400, "renewal policy not found")
+
+
+@app.get("/api/managed-certificates", dependencies=[Depends(require_role("viewer"))])
+def list_managed_certificates(db: Session = Depends(get_db)):
+    rows = db.scalars(select(ManagedCertificate)).all()
+    return [_managed_cert_out(db, m) for m in rows]
+
+
+@app.get("/api/managed-certificates/{managed_id}", dependencies=[Depends(require_role("viewer"))])
+def get_managed_certificate(managed_id: int, db: Session = Depends(get_db)):
+    m = db.get(ManagedCertificate, managed_id)
+    if not m:
+        raise HTTPException(404, "managed certificate not found")
+    return _managed_cert_out(db, m)
+
+
+@app.post("/api/managed-certificates", status_code=201)
+def create_managed_certificate(
+    body: schemas.ManagedCertificateIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    _require_issuer_and_policy(db, body.issuer_id, body.renewal_policy_id)
+    m = ManagedCertificate(**body.model_dump())
+    db.add(m)
+    db.flush()
+    audit(db, principal["email"], "managed_cert.create", "managed_certificate", m.id, m.common_name)
+    db.commit()
+    return _managed_cert_out(db, m)
+
+
+@app.post("/api/certificates/{cert_id}/manage", status_code=201)
+def promote_certificate(
+    cert_id: int,
+    body: schemas.ManageIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    cert = db.get(Certificate, cert_id)
+    if not cert:
+        raise HTTPException(404, "certificate not found")
+    _require_issuer_and_policy(db, body.issuer_id, body.renewal_policy_id)
+    m = ManagedCertificate(
+        common_name=cert.common_name,
+        sans=list(cert.sans or []),
+        issuer_id=body.issuer_id,
+        renewal_policy_id=body.renewal_policy_id,
+        current_certificate_id=cert.id,
+    )
+    db.add(m)
+    db.flush()
+    audit(db, principal["email"], "managed_cert.promote", "managed_certificate", m.id, cert.common_name)
+    db.commit()
+    return _managed_cert_out(db, m)
+
+
+@app.get(
+    "/api/managed-certificates/{managed_id}/deployment-targets",
+    dependencies=[Depends(require_role("viewer"))],
+)
+def list_deployment_targets_for_managed_cert(managed_id: int, db: Session = Depends(get_db)):
+    """Read-only summary for the ManagedCerts detail view -- deliberately
+    omits `config` (may hold keystore/PFX passwords or WinRM credentials,
+    see DeploymentTarget's docstring) since there's no UI need to display it
+    here, unlike Issuer.config which has an established scrub-and-mark
+    convention (`_issuer_out`)."""
+    if not db.get(ManagedCertificate, managed_id):
+        raise HTTPException(404, "managed certificate not found")
+    rows = db.scalars(
+        select(DeploymentTarget).where(DeploymentTarget.managed_certificate_id == managed_id)
+    ).all()
+    return [
+        {
+            "id": t.id, "name": t.name, "kind": t.kind, "enabled": t.enabled,
+            "last_deploy_at": t.last_deploy_at, "last_deploy_ok": t.last_deploy_ok,
+            "managed_certificate_id": t.managed_certificate_id,
+        }
+        for t in rows
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Lifecycle orders (Task 7): approval-gated issue/renew/revoke state machine
+# --------------------------------------------------------------------------- #
+LIFECYCLE_ACTIONS = {"issue", "renew", "revoke"}
+# Revoke EXECUTION is out of Phase-1 scope (no worker dispatch path, no
+# revoking/revoked states, and AD CS -- the primary CA -- doesn't support it).
+# The two-person-rule governance mechanism in lifecycle.create_order/approve
+# still fully supports revoke orders (e.g. seeded directly for tests or by a
+# future admin tool); this route just refuses to CREATE one via the API so a
+# real order can never get stuck dead-lettered in the work queue.
+CREATABLE_ACTIONS = {"issue", "renew"}
+
+
+@app.get("/api/lifecycle/orders", dependencies=[Depends(require_role("viewer"))])
+def list_lifecycle_orders(db: Session = Depends(get_db)):
+    rows = db.scalars(select(LifecycleOrder).order_by(LifecycleOrder.id.desc())).all()
+    return [schemas.LifecycleOrderOut.model_validate(o).model_dump() for o in rows]
+
+
+@app.get("/api/lifecycle/orders/{order_id}", dependencies=[Depends(require_role("viewer"))])
+def get_lifecycle_order(order_id: int, db: Session = Depends(get_db)):
+    order = db.get(LifecycleOrder, order_id)
+    if not order:
+        raise HTTPException(404, "lifecycle order not found")
+    return schemas.LifecycleOrderOut.model_validate(order).model_dump()
+
+
+@app.post("/api/lifecycle/orders", status_code=201)
+def create_lifecycle_order(
+    body: schemas.LifecycleOrderIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    if body.action not in LIFECYCLE_ACTIONS:
+        raise HTTPException(400, f"action must be one of {sorted(LIFECYCLE_ACTIONS)}")
+    if body.action not in CREATABLE_ACTIONS:
+        raise HTTPException(400, "revoke execution is not yet supported")
+    managed_cert = db.get(ManagedCertificate, body.managed_certificate_id)
+    if not managed_cert:
+        raise HTTPException(404, "managed certificate not found")
+    order, created = lifecycle.create_order(db, managed_cert, body.action, principal["email"])
+    if created:
+        audit(db, principal["email"], "lifecycle_order.create", "lifecycle_order", order.id, order.action)
+    db.commit()
+    return schemas.LifecycleOrderOut.model_validate(order).model_dump()
+
+
+@app.post("/api/lifecycle/orders/{order_id}/approve")
+def approve_lifecycle_order(
+    order_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    order = db.get(LifecycleOrder, order_id)
+    if not order:
+        raise HTTPException(404, "lifecycle order not found")
+    try:
+        lifecycle.approve(db, order, principal["email"], is_admin=(principal["role"] == "admin"))
+    except PermissionError:
+        raise HTTPException(403, "revoke approval requires admin")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    audit(db, principal["email"], "lifecycle_order.approve", "lifecycle_order", order.id, order.status)
+    db.commit()
+    return schemas.LifecycleOrderOut.model_validate(order).model_dump()
+
+
+@app.post("/api/lifecycle/orders/{order_id}/reject")
+def reject_lifecycle_order(
+    order_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    order = db.get(LifecycleOrder, order_id)
+    if not order:
+        raise HTTPException(404, "lifecycle order not found")
+    try:
+        lifecycle.reject(db, order, principal["email"])
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    audit(db, principal["email"], "lifecycle_order.reject", "lifecycle_order", order.id, order.status)
+    db.commit()
+    return schemas.LifecycleOrderOut.model_validate(order).model_dump()
+
+
+# --------------------------------------------------------------------------- #
 # Settings
 # --------------------------------------------------------------------------- #
 def _base_url(db: Session) -> str:
@@ -709,6 +1058,44 @@ def dashboard(db: Session = Depends(get_db)):
         if next_scan is None or nxt < next_scan:
             next_scan = nxt
 
+    # --- Lifecycle management metrics (Task 13) ---
+    managed_certificates = db.scalar(select(func.count(ManagedCertificate.id))) or 0
+    # "unmanaged" = observed Certificate rows that no ManagedCertificate
+    # currently points to via current_certificate_id (a cert can only ever
+    # be "current" for at most one ManagedCertificate).
+    managed_cert_fk_ids = select(ManagedCertificate.current_certificate_id).where(
+        ManagedCertificate.current_certificate_id.is_not(None)
+    )
+    unmanaged_certificates = db.scalar(
+        select(func.count(Certificate.id)).where(Certificate.id.notin_(managed_cert_fk_ids))
+    ) or 0
+
+    orders_in_flight = db.scalar(
+        select(func.count(LifecycleOrder.id)).where(
+            LifecycleOrder.status.notin_(list(lifecycle.TERMINAL_STATES))
+        )
+    ) or 0
+    orders_pending_approval = db.scalar(
+        select(func.count(LifecycleOrder.id)).where(LifecycleOrder.status == "pending_approval")
+    ) or 0
+
+    since_30d = now - timedelta(days=30)
+    renew_terminal_30d = db.scalar(
+        select(func.count(LifecycleOrder.id)).where(
+            LifecycleOrder.action == "renew",
+            LifecycleOrder.status.in_(list(lifecycle.TERMINAL_STATES)),
+            LifecycleOrder.updated_at >= since_30d,
+        )
+    ) or 0
+    renew_complete_30d = db.scalar(
+        select(func.count(LifecycleOrder.id)).where(
+            LifecycleOrder.action == "renew",
+            LifecycleOrder.status == "complete",
+            LifecycleOrder.updated_at >= since_30d,
+        )
+    ) or 0
+    renewal_success_rate_30d = (renew_complete_30d / renew_terminal_30d) if renew_terminal_30d else None
+
     return {
         "total_certificates": total_certs,
         "total_endpoints": total_endpoints,
@@ -721,18 +1108,48 @@ def dashboard(db: Session = Depends(get_db)):
         "open_alerts": open_alerts,
         "last_successful_scan": last_ok,
         "next_scheduled_scan": next_scan,
+        "managed_certificates": managed_certificates,
+        "unmanaged_certificates": unmanaged_certificates,
+        "orders_in_flight": orders_in_flight,
+        "orders_pending_approval": orders_pending_approval,
+        "renewal_success_rate_30d": renewal_success_rate_30d,
     }
+
+
+# --------------------------------------------------------------------------- #
+# ACME HTTP-01 challenge responder — PUBLIC (no auth), and must be registered
+# before the SPA catch-all below or it would be swallowed by it.
+# --------------------------------------------------------------------------- #
+@app.get("/.well-known/acme-challenge/{token}")
+def acme_challenge(token: str, db: Session = Depends(get_db)):
+    challenge = db.get(AcmeChallenge, token)
+    if challenge is None:
+        raise HTTPException(status_code=404, detail="unknown challenge token")
+    return PlainTextResponse(challenge.key_authorization)
 
 
 # --------------------------------------------------------------------------- #
 # Static frontend (production) — must be mounted last so /api wins.
 # --------------------------------------------------------------------------- #
+def _safe_static_path(static_dir: str, full_path: str) -> str | None:
+    """Return an absolute path INSIDE static_dir for full_path, or None if it
+    escapes (traversal) or isn't a real file."""
+    if not full_path:
+        return None
+    root = os.path.realpath(static_dir)
+    candidate = os.path.realpath(os.path.join(root, full_path))
+    # candidate must be root itself or strictly within root
+    if candidate != root and not candidate.startswith(root + os.sep):
+        return None
+    return candidate if os.path.isfile(candidate) else None
+
+
 if settings.static_dir and os.path.isdir(settings.static_dir):
     static_dir = settings.static_dir
 
     @app.get("/{full_path:path}")
     def spa(full_path: str):
-        candidate = os.path.join(static_dir, full_path)
-        if full_path and os.path.isfile(candidate):
-            return FileResponse(candidate)
+        safe = _safe_static_path(static_dir, full_path)
+        if safe:
+            return FileResponse(safe)
         return FileResponse(os.path.join(static_dir, "index.html"))

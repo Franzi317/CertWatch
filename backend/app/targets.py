@@ -102,19 +102,22 @@ def expand(target_type: str, value: str, max_hosts: int) -> list[ScanUnit]:
             net = ipaddress.ip_network(value, strict=False)
         except ValueError as e:
             raise TargetError(f"invalid CIDR block: {value!r}") from e
+        # Guard on the cheap upper-bound BEFORE materializing any host list —
+        # num_addresses is O(1) and is always >= len(list(net.hosts())), so
+        # this rejects huge blocks (e.g. 0.0.0.0/0) instantly instead of
+        # exhausting memory building billions of ip_address objects first.
+        _guard(net.num_addresses, max_hosts, value)
         hosts = list(net.hosts()) or [net.network_address]
-        _guard(len(hosts), max_hosts, value)
         return [ScanUnit(host="", ip=str(ip)) for ip in hosts]
 
     if target_type == "range":
-        ips = _expand_range(value)
-        _guard(len(ips), max_hosts, value)
+        ips = _expand_range(value, max_hosts)
         return [ScanUnit(host="", ip=str(ip)) for ip in ips]
 
     raise TargetError(f"unknown target type: {target_type!r}")
 
 
-def _expand_range(value: str) -> list:
+def _expand_range(value: str, max_hosts: int) -> list:
     """Expand 'A-B'. B may be a full IP or just the final octet(s) shorthand
     (e.g. 10.0.0.10-50)."""
     parts = value.split("-", 1)
@@ -139,6 +142,10 @@ def _expand_range(value: str) -> list:
         raise TargetError("range start and end must be the same IP version")
     if int(end) < int(start):
         raise TargetError("range end must be >= start")
+    # Cheap count guard BEFORE materializing — avoids building a huge list of
+    # ip_address objects for something like 10.0.0.0-10.255.255.255.
+    count = int(end) - int(start) + 1
+    _guard(count, max_hosts, value)
     return [ipaddress.ip_address(i) for i in range(int(start), int(end) + 1)]
 
 

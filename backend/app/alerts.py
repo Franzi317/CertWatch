@@ -28,6 +28,13 @@ from .status import days_until, expiry_phrase, severity
 
 log = logging.getLogger("certwatch.alerts")
 
+# Rule types that are raised one-off / event-driven (via `raise_alert` or
+# `record_change_alert`) rather than recomputed every `evaluate_alerts` sweep.
+# These must never be auto-resolved by the scan-derived reconciliation loop
+# below, since they have no corresponding entry in `desired` -- resolving them
+# there would silently prevent `dispatch_alerts` from ever sending them.
+ONE_OFF_RULE_TYPES = {"changed", "renewal_failed", "deploy_failed", "order_stuck"}
+
 
 def get_setting(db: Session, key: str, default):
     row = db.get(SystemSetting, key)
@@ -104,10 +111,11 @@ def evaluate_alerts(db: Session, now: datetime | None = None, dispatch: bool = T
             ev.message, ev.severity = d["message"], d["severity"]
 
     # Auto-resolve events whose condition no longer holds (renewed certs, recovery).
-    # "changed" alerts are kept until acknowledged (informational history).
+    # One-off/event-driven alerts (see ONE_OFF_RULE_TYPES) are kept until
+    # acknowledged (informational history / not part of this scan-derived sweep).
     resolved = 0
     for key, ev in existing.items():
-        if key not in desired and not ev.resolved and ev.rule_type != "changed":
+        if key not in desired and not ev.resolved and ev.rule_type not in ONE_OFF_RULE_TYPES:
             ev.resolved = True
             resolved += 1
 
@@ -115,6 +123,39 @@ def evaluate_alerts(db: Session, now: datetime | None = None, dispatch: bool = T
 
     sent = dispatch_alerts(db, now) if dispatch else 0
     return {"created": created, "resolved": resolved, "notified": sent}
+
+
+def raise_alert(
+    db: Session,
+    dedupe_key: str,
+    rule_type: str,
+    severity: str,
+    message: str,
+    certificate_id: int | None = None,
+    endpoint_id: int | None = None,
+) -> AlertEvent | None:
+    """Create a one-off AlertEvent for a condition that isn't part of the
+    periodic `evaluate_alerts` sweep (worker failures, stuck lifecycle
+    orders, ...), deduped by `dedupe_key` the same way `evaluate_alerts`
+    dedupes its own conditions -- one row per distinct condition, so calling
+    this repeatedly for the same still-failing condition (e.g. a worker
+    retrying the same order) never spams duplicate rows. `dispatch_alerts`
+    picks the new row up on its normal cadence like any other alert; no new
+    alert infrastructure. Returns the created AlertEvent, or None if one
+    already existed (dedup fired -- condition already recorded)."""
+    if db.scalar(select(AlertEvent).where(AlertEvent.dedupe_key == dedupe_key)):
+        return None
+    ev = AlertEvent(
+        dedupe_key=dedupe_key,
+        certificate_id=certificate_id,
+        endpoint_id=endpoint_id,
+        rule_type=rule_type,
+        severity=severity,
+        message=message,
+    )
+    db.add(ev)
+    db.commit()
+    return ev
 
 
 def record_change_alert(db: Session, endpoint: Endpoint, cert: Certificate) -> None:
@@ -189,6 +230,9 @@ def _format(db: Session, ev: AlertEvent):
         "changed": "Confirm this certificate change was expected.",
         "scan_failure": "Verify the endpoint is reachable and serving TLS.",
         "self_signed": "Replace with a CA-issued certificate if this is not intentional.",
+        "renewal_failed": "Certificate renewal failed. Check the issuer connection and the lifecycle order error, then retry.",
+        "deploy_failed": "Certificate deployment/verification failed. Check the deployment target and re-run the order.",
+        "order_stuck": "A lifecycle order has been stuck in a non-terminal state. Investigate the worker and the order's transition log.",
     }.get(ev.rule_type, "Review the certificate.")
 
     facts = {
