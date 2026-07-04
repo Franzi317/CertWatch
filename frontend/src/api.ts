@@ -101,6 +101,7 @@ export interface Dashboard {
   open_alerts: number; last_successful_scan: string | null; next_scheduled_scan: string | null;
   managed_certificates: number; unmanaged_certificates: number; orders_in_flight: number;
   orders_pending_approval: number; renewal_success_rate_30d: number | null;
+  open_findings: number; findings_by_severity: Record<string, number>;
 }
 export interface RenewalPolicy {
   id: number; name: string; renew_before_days: number; key_algorithm: string; key_size: number;
@@ -122,3 +123,10 @@ export interface LifecycleOrder {
   approved_by: string; approved_at: string | null; error: string; correlation_id: string;
   transitions: LifecycleTransition[]; created_at: string; updated_at: string;
 }
+export interface Finding {
+  id: number; rule_id: string; severity: string; certificate_id: number | null;
+  endpoint_id: number | null; title: string; detail: string; dedupe_key: string;
+  disposition: string; status: string; first_seen: string; last_seen: string;
+  created_at: string; updated_at: string;
+}
+export interface FindingList { total: number; items: Finding[]; }

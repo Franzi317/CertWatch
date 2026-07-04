@@ -58,6 +58,12 @@ export default function Dashboard() {
               <StatCard label="Failed scans" value={d.failed_scans} severity={d.failed_scans ? "warning" : "healthy"} />
               <StatCard label="Recently changed (7d)" value={d.recently_changed} />
               <StatCard label="Open alerts" value={d.open_alerts} severity={d.open_alerts ? "warning" : "healthy"} />
+              <StatCard label="Open findings" value={d.open_findings} severity={d.open_findings ? "warning" : "healthy"} />
+              <StatCard
+                label="Critical findings"
+                value={d.findings_by_severity?.critical ?? 0}
+                severity={(d.findings_by_severity?.critical ?? 0) ? "critical" : "healthy"}
+              />
               <StatCard label="Managed certificates" value={d.managed_certificates} severity="info" />
               <StatCard label="Unmanaged certificates" value={d.unmanaged_certificates} />
               <StatCard label="Orders in flight" value={d.orders_in_flight} severity={d.orders_in_flight ? "info" : "healthy"} />
