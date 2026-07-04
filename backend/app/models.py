@@ -291,6 +291,10 @@ class ManagedCertificate(Base):
     issuer_id: Mapped[int] = mapped_column(ForeignKey("issuers.id"))
     renewal_policy_id: Mapped[int] = mapped_column(ForeignKey("renewal_policies.id"))
     current_certificate_id: Mapped[int | None] = mapped_column(ForeignKey("certificates.id"))
+    # Encrypted (app.secrets) PEM of the private key for current_certificate_id,
+    # generated at issuance time (migration 0011). Needed by deployment (Task 9)
+    # to build the PFX/PEM bundle -- never stored in plaintext.
+    current_key_ref: Mapped[str] = mapped_column(Text, default="")
     # state: active | renewing | error | retired (validated in the app layer, not the DB)
     state: Mapped[str] = mapped_column(String(16), default="active")
     owner: Mapped[str] = mapped_column(String(255), default="")

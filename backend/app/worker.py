@@ -5,16 +5,35 @@ it; `run_forever` polls in a loop and is the entry point for both the
 embedded worker thread (see `main.py` lifespan, `CERTWATCH_EMBEDDED_WORKER`)
 and the standalone `python -m app.worker` process used in production
 (`docker-compose.yml`'s `worker` service).
+
+Kinds "issue"/"renew" (Task 8) drive a `LifecycleOrder` through
+queued -> issuing -> deploying: generate a key+CSR per the managed cert's
+RenewalPolicy, call the issuer adapter, store the issued cert, persist the
+(encrypted) private key, and enqueue a "deploy" work item for Task 9. Any
+failure fails closed: the order transitions to "failed", the managed cert's
+state becomes "error", and the queue item is failed (subject to its own
+retry/backoff via `queue.fail`).
 """
 from __future__ import annotations
 
 import logging
+import re
 import time
 
-from . import queue, scan_engine
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+from sqlalchemy.orm.attributes import flag_modified
+
+from . import lifecycle, queue, scan_engine, secrets
+from .crypto_keys import build_csr, generate_private_key
 from .db import SessionLocal
+from .issuers.base import get_adapter
+from .models import Issuer, LifecycleOrder, ManagedCertificate, RenewalPolicy
+from .scanner import parse_certificate
 
 log = logging.getLogger("certwatch.worker")
+
+_PEM_CERT_RE = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.DOTALL)
 
 
 def process_one(db) -> bool:
@@ -32,10 +51,101 @@ def process_one(db) -> bool:
             queue.fail(db, item, str(e))
         else:
             queue.complete(db, item)
+    elif item.kind in ("issue", "renew"):
+        _process_issuance(db, item)
     else:
         queue.fail(db, item, f"unknown kind: {item.kind}")
 
     return True
+
+
+def _process_issuance(db, item) -> None:
+    order_id = item.payload.get("order_id")
+    order = db.get(LifecycleOrder, order_id) if order_id is not None else None
+    if order is None:
+        queue.fail(db, item, f"lifecycle order {order_id!r} not found")
+        return
+
+    if order.status != "queued":
+        # Already processed (e.g. a stale/duplicate queue item, or a retry
+        # after the previous attempt actually succeeded) -- nothing to do.
+        log.info("order %s already in status %s, skipping issuance", order.id, order.status)
+        queue.complete(db, item)
+        return
+
+    managed: ManagedCertificate | None = None
+    try:
+        lifecycle.transition(db, order, "issuing")
+
+        managed = db.get(ManagedCertificate, order.managed_certificate_id)
+        if managed is None:
+            raise RuntimeError(f"managed certificate {order.managed_certificate_id} not found")
+
+        policy = db.get(RenewalPolicy, managed.renewal_policy_id)
+        issuer = db.get(Issuer, managed.issuer_id)
+        if policy is None:
+            raise RuntimeError(f"renewal policy {managed.renewal_policy_id} not found")
+        if issuer is None:
+            raise RuntimeError(f"issuer {managed.issuer_id} not found")
+
+        key_result = generate_private_key(policy.key_algorithm, policy.key_size)
+        csr_pem = build_csr(key_result.key_pem, managed.common_name, managed.sans)
+
+        adapter = get_adapter(issuer)
+        issued = adapter.issue(csr_pem, {})
+
+        cert = _store_issued_cert(db, issued)
+
+        managed.current_certificate_id = cert.id
+        managed.current_key_ref = secrets.encrypt(key_result.key_pem)
+        # Mid-flow (deployment + verification are still ahead, Tasks 9/12);
+        # "active" is only set once the deploy+verify steps succeed.
+        managed.state = "renewing"
+
+        # ACME account keys are generated + cached lazily by the adapter, in
+        # memory, on the *same* dict object `issuer.config` returns -- but
+        # Issuer.config is a plain JSON column, not a MutableDict, so that
+        # in-place mutation is invisible to SQLAlchemy's change tracking.
+        # Reassigning to a *new* dict isn't enough either: SQLAlchemy's flush
+        # compares the new value against the (already-mutated, since it's the
+        # same dict) old value by equality and sees no net change, so the
+        # UPDATE silently drops the column. flag_modified() forces it into
+        # the UPDATE regardless. No-op for AD CS.
+        if issuer.issuer_type == "acme":
+            issuer.config = dict(issuer.config)
+            flag_modified(issuer, "config")
+
+        db.commit()
+
+        lifecycle.transition(db, order, "deploying")
+        queue.enqueue(db, "deploy", {"order_id": order.id})
+    except Exception as e:  # noqa: BLE001 - fail-closed: no half-completed issuance
+        log.exception("issuance failed for order %s (queue item %s)", order_id, item.id)
+        db.rollback()
+        lifecycle.transition(db, order, "failed", str(e))
+        if managed is not None:
+            managed.state = "error"
+            db.commit()
+        queue.fail(db, item, str(e))
+    else:
+        queue.complete(db, item)
+
+
+def _store_issued_cert(db, issued):
+    """Store an adapter-issued certificate as a `Certificate` row, reusing
+    `scan_engine._upsert_certificate` (dedup-by-fingerprint) so issued certs
+    show up in the same inventory table scanned certs do. Parses the PEM with
+    `cryptography`/`scanner.parse_certificate` rather than duplicating field
+    extraction here."""
+    leaf_der = x509.load_pem_x509_certificate(issued.certificate_pem.encode()).public_bytes(
+        serialization.Encoding.DER
+    )
+    chain_der = [
+        x509.load_pem_x509_certificate(block.encode()).public_bytes(serialization.Encoding.DER)
+        for block in _PEM_CERT_RE.findall(issued.chain_pem or "")
+    ]
+    fields = parse_certificate(leaf_der, chain_der)
+    return scan_engine._upsert_certificate(db, fields)
 
 
 def run_forever(poll_interval: float = 2.0, stop_event=None) -> None:
