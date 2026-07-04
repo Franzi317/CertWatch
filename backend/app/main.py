@@ -11,7 +11,7 @@ import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from sqlalchemy import String, cast, func, or_, select
@@ -22,6 +22,7 @@ from . import lifecycle, schemas, targets as target_lib
 from .alerts import dispatch_alerts, evaluate_alerts
 from .auth import require_role, router as auth_router
 from .config import settings
+from .exports import rows_to_csv
 from .secrets import SecretsNotConfigured, encrypt as encrypt_secret, is_encrypted
 from .db import engine, get_db, init_db, run_migrations
 from .issuers.base import IssuerError, get_adapter
@@ -59,6 +60,28 @@ DEFAULT_SETTINGS = {
     "app_base_url": "http://localhost:5173",
     "default_ports": [443, 8443, 9443, 636, 993, 995, 465, 587, 3389, 5986],
 }
+
+# CSV column sets for ?format=csv on the list endpoints (Phase 2, Task 1).
+# Each is a flat projection of the existing JSON item dict (cert_dict /
+# endpoint_dict / LifecycleOrderOut / _audit_dict) -- picked as the columns
+# an operator would want in a spreadsheet, dropping nested/verbose fields
+# (sans, pem, transitions, endpoint list, etc).
+CERTIFICATE_CSV_COLUMNS = [
+    "id", "common_name", "issuer_cn", "not_before", "not_after",
+    "public_key_algorithm", "public_key_size", "signature_algorithm",
+    "self_signed", "fingerprint_sha256",
+]
+ENDPOINT_CSV_COLUMNS = [
+    "id", "host", "ip", "port", "target_name", "environment", "owner",
+    "last_status", "common_name", "issuer_cn", "not_after", "days_until_expiry",
+]
+LIFECYCLE_ORDER_CSV_COLUMNS = [
+    "id", "managed_certificate_id", "action", "status", "attempts",
+    "approved_by", "approved_at", "error", "created_at", "updated_at",
+]
+AUDIT_CSV_COLUMNS = [
+    "id", "actor", "action", "entity", "entity_id", "detail", "created_at",
+]
 
 
 @asynccontextmanager
@@ -305,6 +328,7 @@ def list_certificates(
     sort: str = "not_after",
     limit: int = Query(100, le=1000),
     offset: int = 0,
+    format: str = "json",
     db: Session = Depends(get_db),
 ):
     stmt = select(Certificate)
@@ -337,7 +361,12 @@ def list_certificates(
 
     order = Certificate.not_after.asc() if sort == "not_after" else Certificate.common_name.asc()
     rows = db.scalars(stmt.order_by(order).limit(limit).offset(offset)).all()
-    return {"total": total, "items": [cert_dict(db, c) for c in rows]}
+    items = [cert_dict(db, c) for c in rows]
+    if format == "csv":
+        csv_text = rows_to_csv(CERTIFICATE_CSV_COLUMNS, items)
+        return Response(content=csv_text, media_type="text/csv",
+                         headers={"Content-Disposition": 'attachment; filename="certificates.csv"'})
+    return {"total": total, "items": items}
 
 
 @app.get("/api/certificates/{cert_id}", dependencies=[Depends(require_role("viewer"))])
@@ -369,6 +398,7 @@ def list_endpoints(
     failed: bool | None = None,
     limit: int = Query(200, le=2000),
     offset: int = 0,
+    format: str = "json",
     db: Session = Depends(get_db),
 ):
     stmt = select(Endpoint)
@@ -394,7 +424,12 @@ def list_endpoints(
             stmt = stmt.where(func.lower(Target.owner).like(f"%{owner.lower()}%"))
     total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     rows = db.scalars(stmt.order_by(Endpoint.id.desc()).limit(limit).offset(offset)).all()
-    return {"total": total, "items": [endpoint_dict(db, e, with_cert=False) for e in rows]}
+    items = [endpoint_dict(db, e, with_cert=False) for e in rows]
+    if format == "csv":
+        csv_text = rows_to_csv(ENDPOINT_CSV_COLUMNS, items)
+        return Response(content=csv_text, media_type="text/csv",
+                         headers={"Content-Disposition": 'attachment; filename="endpoints.csv"'})
+    return {"total": total, "items": items}
 
 
 @app.get("/api/endpoints/{endpoint_id}", dependencies=[Depends(require_role("viewer"))])
@@ -886,9 +921,14 @@ CREATABLE_ACTIONS = {"issue", "renew"}
 
 
 @app.get("/api/lifecycle/orders", dependencies=[Depends(require_role("viewer"))])
-def list_lifecycle_orders(db: Session = Depends(get_db)):
+def list_lifecycle_orders(format: str = "json", db: Session = Depends(get_db)):
     rows = db.scalars(select(LifecycleOrder).order_by(LifecycleOrder.id.desc())).all()
-    return [schemas.LifecycleOrderOut.model_validate(o).model_dump() for o in rows]
+    items = [schemas.LifecycleOrderOut.model_validate(o).model_dump() for o in rows]
+    if format == "csv":
+        csv_text = rows_to_csv(LIFECYCLE_ORDER_CSV_COLUMNS, items)
+        return Response(content=csv_text, media_type="text/csv",
+                         headers={"Content-Disposition": 'attachment; filename="lifecycle-orders.csv"'})
+    return items
 
 
 @app.get("/api/lifecycle/orders/{order_id}", dependencies=[Depends(require_role("viewer"))])
@@ -1011,6 +1051,7 @@ def list_audit(
     entity: str | None = None,
     action: str | None = None,
     since: datetime | None = None,
+    format: str = "json",
     db: Session = Depends(get_db),
 ):
     stmt = select(AuditLog)
@@ -1026,7 +1067,12 @@ def list_audit(
     rows = db.scalars(
         stmt.order_by(AuditLog.created_at.desc()).limit(limit).offset(offset)
     ).all()
-    return {"total": total, "items": [_audit_dict(r) for r in rows]}
+    items = [_audit_dict(r) for r in rows]
+    if format == "csv":
+        csv_text = rows_to_csv(AUDIT_CSV_COLUMNS, items)
+        return Response(content=csv_text, media_type="text/csv",
+                         headers={"Content-Disposition": 'attachment; filename="audit.csv"'})
+    return {"total": total, "items": items}
 
 
 # --------------------------------------------------------------------------- #
