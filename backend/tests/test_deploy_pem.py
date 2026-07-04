@@ -267,6 +267,57 @@ def test_worker_deploy_step_failing_connector_fails_order_and_managed(db, tmp_pa
     assert "boom" in item.last_error
 
 
+def test_worker_deploy_step_multi_target_partial_failure_fails_closed(db, tmp_path, monkeypatch):
+    # target 1 has no post_deploy_command (always succeeds); target 2's
+    # post_deploy_command is monkeypatched to fail. Both targets get their
+    # files written -- target 1's write completes before target 2 fails --
+    # but the overall deploy is fail-closed: order -> failed, managed cert
+    # -> error, and no "verify" item is enqueued despite target 1's success.
+    def fake_run_command(cmd):
+        if cmd == "reload-target-2":
+            return 1, "boom-target-2"
+        return 0, "ok"
+
+    monkeypatch.setattr(pem_mod, "_run_command", fake_run_command)
+    managed, order, target1 = _seed_deploying_order(db, tmp_path)
+
+    target2_dir = tmp_path / "target2"
+    target2_dir.mkdir()
+    target2 = DeploymentTarget(
+        name="fs-target-2", kind="pem",
+        config={
+            "cert_path": str(target2_dir / "cert.pem"),
+            "chain_path": str(target2_dir / "chain.pem"),
+            "fullchain_path": str(target2_dir / "fullchain.pem"),
+            "key_path": str(target2_dir / "key.pem"),
+        },
+        post_deploy_command="reload-target-2",
+        managed_certificate_id=managed.id, enabled=True,
+    )
+    db.add(target2)
+    db.commit()
+    db.refresh(target2)
+
+    item = queue.enqueue(db, "deploy", {"order_id": order.id})
+    result = worker.process_one(db)
+    assert result is True
+
+    db.refresh(order)
+    assert order.status == "failed"
+
+    db.refresh(managed)
+    assert managed.state == "error"
+
+    db.refresh(target1)
+    assert target1.last_deploy_ok is True
+
+    db.refresh(target2)
+    assert target2.last_deploy_ok is False
+
+    verify_items = db.query(WorkQueue).filter(WorkQueue.kind == "verify").all()
+    assert len(verify_items) == 0
+
+
 def test_worker_deploy_step_with_no_targets_still_reaches_verifying(db, tmp_path):
     managed, order, target = _seed_deploying_order(db, tmp_path)
     db.delete(target)
