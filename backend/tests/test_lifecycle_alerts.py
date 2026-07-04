@@ -15,7 +15,7 @@ import datetime
 from sqlalchemy import update
 from conftest import login_as
 
-from app import queue, scan_engine, scheduler, worker
+from app import alerts, queue, scan_engine, scheduler, worker
 from app.db import SessionLocal
 from app.issuers.base import IssuerError
 from app.models import (
@@ -228,6 +228,39 @@ def test_order_stuck_tick_ignores_old_terminal_order(db):
 
     events = db.query(AlertEvent).filter(AlertEvent.rule_type == "order_stuck").all()
     assert len(events) == 0
+
+
+# --------------------------------------------------------------------------- #
+# Regression: evaluate_alerts must not auto-resolve one-off lifecycle alerts
+# --------------------------------------------------------------------------- #
+def test_evaluate_alerts_does_not_auto_resolve_lifecycle_alerts(db):
+    managed, order = _seed_order(db, status="issuing")
+
+    ev = alerts.raise_alert(
+        db, dedupe_key=f"renewal_failed:{order.id}", rule_type="renewal_failed",
+        severity="critical", message="CA unreachable", endpoint_id=None,
+        certificate_id=None,
+    )
+    assert ev is not None
+    assert ev.resolved is False
+
+    # Also plant a stale scan-derived alert (no matching endpoint/cert exists),
+    # to confirm normal scan-derived auto-resolution still works after the fix.
+    stale = AlertEvent(
+        dedupe_key="expiring:999999:999999:30", endpoint_id=None, certificate_id=None,
+        rule_type="expiring", severity="warning", message="stale", resolved=False,
+    )
+    db.add(stale)
+    db.commit()
+
+    # This is the exact call that runs after every scan job completes.
+    alerts.evaluate_alerts(db, dispatch=False)
+
+    db.refresh(ev)
+    assert ev.resolved is False, "lifecycle alert must survive the scan-derived auto-resolve sweep"
+
+    db.refresh(stale)
+    assert stale.resolved is True, "stale scan-derived alerts must still auto-resolve normally"
 
 
 # --------------------------------------------------------------------------- #
