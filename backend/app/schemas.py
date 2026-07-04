@@ -148,6 +148,11 @@ class ManageIn(BaseModel):
     renewal_policy_id: int
 
 
+class FindingDispositionIn(BaseModel):
+    disposition: Literal["open", "accepted", "resolved"]
+    note: str | None = None
+
+
 class LifecycleOrderIn(BaseModel):
     managed_certificate_id: int
     action: str  # issue | renew | revoke

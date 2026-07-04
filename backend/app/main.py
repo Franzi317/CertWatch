@@ -18,7 +18,7 @@ from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import lifecycle, schemas, targets as target_lib
+from . import findings, lifecycle, schemas, targets as target_lib
 from .alerts import dispatch_alerts, evaluate_alerts
 from .auth import require_role, router as auth_router
 from .config import settings
@@ -34,6 +34,7 @@ from .models import (
     CertificateObservation,
     DeploymentTarget,
     Endpoint,
+    Finding,
     Issuer,
     LifecycleOrder,
     ManagedCertificate,
@@ -81,6 +82,10 @@ LIFECYCLE_ORDER_CSV_COLUMNS = [
 ]
 AUDIT_CSV_COLUMNS = [
     "id", "actor", "action", "entity", "entity_id", "detail", "created_at",
+]
+FINDING_CSV_COLUMNS = [
+    "id", "rule_id", "severity", "certificate_id", "endpoint_id", "title",
+    "disposition", "status", "first_seen", "last_seen",
 ]
 
 
@@ -532,6 +537,102 @@ def unmute_alert(
 @app.post("/api/alerts/evaluate", dependencies=[Depends(require_role("operator"))])
 def evaluate(db: Session = Depends(get_db)):
     return evaluate_alerts(db)
+
+
+# --------------------------------------------------------------------------- #
+# Findings (crypto-risk rules engine, Phase 2 Task 3)
+# --------------------------------------------------------------------------- #
+def finding_dict(f: Finding) -> dict:
+    return {
+        "id": f.id,
+        "rule_id": f.rule_id,
+        "severity": f.severity,
+        "certificate_id": f.certificate_id,
+        "endpoint_id": f.endpoint_id,
+        "title": f.title,
+        "detail": f.detail,
+        "dedupe_key": f.dedupe_key,
+        "disposition": f.disposition,
+        "status": f.status,
+        "first_seen": f.first_seen,
+        "last_seen": f.last_seen,
+        "created_at": f.created_at,
+        "updated_at": f.updated_at,
+    }
+
+
+@app.get("/api/findings", dependencies=[Depends(require_role("viewer"))])
+def list_findings(
+    rule_id: str = "",
+    severity: str = "",
+    disposition: str = "",
+    status: str = "active",
+    q: str = "",
+    format: str = "json",
+    limit: int = Query(100, le=1000),
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    stmt = select(Finding)
+    if rule_id:
+        stmt = stmt.where(Finding.rule_id == rule_id)
+    if severity:
+        stmt = stmt.where(Finding.severity == severity)
+    if disposition:
+        stmt = stmt.where(Finding.disposition == disposition)
+    if status:
+        stmt = stmt.where(Finding.status == status)
+    if q:
+        like = f"%{q.lower()}%"
+        stmt = stmt.where(or_(
+            func.lower(Finding.title).like(like),
+            func.lower(Finding.detail).like(like),
+        ))
+    total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows = db.scalars(
+        stmt.order_by(Finding.severity.asc(), Finding.id.desc()).limit(limit).offset(offset)
+    ).all()
+    items = [finding_dict(f) for f in rows]
+    if format == "csv":
+        csv_text = rows_to_csv(FINDING_CSV_COLUMNS, items)
+        return Response(content=csv_text, media_type="text/csv",
+                         headers={"Content-Disposition": 'attachment; filename="findings.csv"'})
+    return {"total": total, "items": items}
+
+
+@app.get("/api/findings/{finding_id}", dependencies=[Depends(require_role("viewer"))])
+def get_finding(finding_id: int, db: Session = Depends(get_db)):
+    f = db.get(Finding, finding_id)
+    if not f:
+        raise HTTPException(404, "finding not found")
+    return finding_dict(f)
+
+
+@app.post("/api/findings/{finding_id}/disposition")
+def set_finding_disposition(
+    finding_id: int,
+    body: schemas.FindingDispositionIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    f = db.get(Finding, finding_id)
+    if not f:
+        raise HTTPException(404, "finding not found")
+    f.disposition = body.disposition
+    audit(db, principal["email"], "finding.disposition", "finding", f.id, body.disposition)
+    db.commit()
+    return finding_dict(f)
+
+
+@app.post("/api/findings/evaluate")
+def evaluate_findings(
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    active = findings.evaluate_all(db)
+    audit(db, principal["email"], "finding.evaluate", "finding", "-", str(active))
+    db.commit()
+    return {"active": active}
 
 
 # --------------------------------------------------------------------------- #
@@ -1142,6 +1243,17 @@ def dashboard(db: Session = Depends(get_db)):
     ) or 0
     renewal_success_rate_30d = (renew_complete_30d / renew_terminal_30d) if renew_terminal_30d else None
 
+    # --- Findings risk metrics (Task 3) ---
+    open_findings = db.scalar(
+        select(func.count(Finding.id)).where(Finding.status == "active", Finding.disposition == "open")
+    ) or 0
+    severity_rows = db.execute(
+        select(Finding.severity, func.count(Finding.id))
+        .where(Finding.status == "active", Finding.disposition == "open")
+        .group_by(Finding.severity)
+    ).all()
+    findings_by_severity = {sev: cnt for sev, cnt in severity_rows}
+
     return {
         "total_certificates": total_certs,
         "total_endpoints": total_endpoints,
@@ -1159,6 +1271,8 @@ def dashboard(db: Session = Depends(get_db)):
         "orders_in_flight": orders_in_flight,
         "orders_pending_approval": orders_pending_approval,
         "renewal_success_rate_30d": renewal_success_rate_30d,
+        "open_findings": open_findings,
+        "findings_by_severity": findings_by_severity,
     }
 
 
