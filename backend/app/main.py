@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import pathlib
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -23,6 +24,7 @@ from .alerts import dispatch_alerts, evaluate_alerts
 from .auth import require_role, router as auth_router
 from .config import settings
 from .exports import rows_to_csv
+from . import secrets as app_secrets
 from .secrets import SecretsNotConfigured, encrypt as encrypt_secret, is_encrypted
 from .db import engine, get_db, init_db, run_migrations
 from .issuers.base import IssuerError, get_adapter
@@ -30,6 +32,7 @@ from .models import (
     AcmeChallenge,
     AlertEvent,
     AuditLog,
+    Base,
     Certificate,
     CertificateObservation,
     DeploymentTarget,
@@ -1175,6 +1178,84 @@ def list_audit(
         return Response(content=csv_text, media_type="text/csv",
                          headers={"Content-Disposition": 'attachment; filename="audit.csv"'})
     return {"total": total, "items": items}
+
+
+# --------------------------------------------------------------------------- #
+# Restore verification (Phase 2, Task 6: backup/restore/DR)
+# --------------------------------------------------------------------------- #
+def _restore_check_secret_decrypt_ok(db: Session) -> bool:
+    """Prove the current CERTWATCH_MASTER_KEY matches the data, without ever
+    exposing plaintext or ciphertext. Always does a self round-trip; if any
+    encrypted secret exists on a NotificationChannel/Issuer, also attempts to
+    decrypt the first one found."""
+    try:
+        if app_secrets.decrypt(app_secrets.encrypt("probe")) != "probe":
+            return False
+    except SecretsNotConfigured:
+        return False
+
+    for ch in db.scalars(select(NotificationChannel)).all():
+        for v in (ch.config or {}).values():
+            if isinstance(v, str) and is_encrypted(v):
+                try:
+                    app_secrets.decrypt(v)
+                except Exception:
+                    return False
+                return True
+    for issuer in db.scalars(select(Issuer)).all():
+        for v in (issuer.config or {}).values():
+            if isinstance(v, str) and is_encrypted(v):
+                try:
+                    app_secrets.decrypt(v)
+                except Exception:
+                    return False
+                return True
+    return True
+
+
+@app.post("/api/admin/restore-check")
+def restore_check(
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("admin")),
+):
+    from alembic.config import Config
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+    from sqlalchemy import inspect
+
+    backend_dir = pathlib.Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend_dir / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend_dir / "alembic"))
+    head = ScriptDirectory.from_config(cfg).get_current_head()
+    with engine.connect() as conn:
+        current = MigrationContext.configure(conn).get_current_revision()
+
+    expected = set(Base.metadata.tables.keys())
+    present = set(inspect(engine).get_table_names())
+    tables_ok = expected.issubset(present)
+    # current is None on a fresh create_all/pre-stamp DB (SQLite tests, or a
+    # brand-new Postgres DB before run_migrations() stamps it) -- that's not
+    # a failure, only a mismatched non-null revision is.
+    schema_ok = tables_ok and (current == head or current is None)
+
+    counts = {
+        "certificates": db.scalar(select(func.count(Certificate.id))) or 0,
+        "endpoints": db.scalar(select(func.count(Endpoint.id))) or 0,
+        "managed_certificates": db.scalar(select(func.count(ManagedCertificate.id))) or 0,
+        "findings": db.scalar(select(func.count(Finding.id))) or 0,
+    }
+
+    secret_decrypt_ok = _restore_check_secret_decrypt_ok(db)
+
+    audit(db, principal["email"], "admin.restore_check", "system", "-", f"schema_ok={schema_ok}")
+    db.commit()
+    return {
+        "schema_ok": schema_ok,
+        "revision": current,
+        "head": head,
+        "counts": counts,
+        "secret_decrypt_ok": secret_decrypt_ok,
+    }
 
 
 # --------------------------------------------------------------------------- #
