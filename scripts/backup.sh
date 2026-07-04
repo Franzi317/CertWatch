@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # CertWatch database backup.
 #
 # Dumps the Postgres database to a timestamped plain-SQL file using pg_dump.

@@ -40,7 +40,10 @@ resulting file to durable, access-controlled storage.
 ./scripts/restore.sh certwatch-backup-20260704-020000.sql
 ```
 
-Restores the dump via `psql` into the database at `CERTWATCH_DATABASE_URL`.
+Restores the dump via `psql` (with `ON_ERROR_STOP=1`, so a failed statement
+aborts the restore instead of silently continuing) into the database at
+`CERTWATCH_DATABASE_URL`. **Restore into a fresh/empty database** — restoring
+over an existing schema will error on the first `CREATE` and abort.
 After restoring:
 
 1. Set `CERTWATCH_MASTER_KEY` to the **exact same value** used when the

@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # CertWatch database restore.
 #
 # Restores a plain-SQL dump (produced by scripts/backup.sh) via psql.
@@ -14,7 +14,8 @@ if [ -z "${CERTWATCH_DATABASE_URL:-}" ]; then
 fi
 
 echo "Restoring ${DUMP_FILE} into the database at CERTWATCH_DATABASE_URL ..."
-psql "${CERTWATCH_DATABASE_URL}" < "${DUMP_FILE}"
+echo "(restore expects a fresh/empty target database; ON_ERROR_STOP aborts on the first error)"
+psql -v ON_ERROR_STOP=1 -q "${CERTWATCH_DATABASE_URL}" < "${DUMP_FILE}"
 
 echo "=================================================================="
 echo "Restore complete. Before starting the app:"
