@@ -15,6 +15,7 @@ from __future__ import annotations
 from uuid import uuid4
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import queue
@@ -35,11 +36,7 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
 TERMINAL_STATES = {"complete", "failed", "rolled_back"}
 
 
-def create_order(db: Session, managed_cert: ManagedCertificate, action: str, actor: str) -> LifecycleOrder:
-    """Idempotent per (managed_cert, action): if an OPEN order (status not in
-    TERMINAL_STATES) already exists for this pair, return it instead of
-    creating a duplicate -- avoids racing/duplicate concurrent orders for the
-    same certificate action."""
+def _find_open_order(db: Session, managed_cert: ManagedCertificate, action: str) -> LifecycleOrder | None:
     existing = db.scalars(
         select(LifecycleOrder).where(
             LifecycleOrder.managed_certificate_id == managed_cert.id,
@@ -49,6 +46,24 @@ def create_order(db: Session, managed_cert: ManagedCertificate, action: str, act
     for order in existing:
         if order.status not in TERMINAL_STATES:
             return order
+    return None
+
+
+def create_order(db: Session, managed_cert: ManagedCertificate, action: str, actor: str) -> tuple[LifecycleOrder, bool]:
+    """Idempotent per (managed_cert, action): if an OPEN order (status not in
+    TERMINAL_STATES) already exists for this pair, return it instead of
+    creating a duplicate. This is genuinely race-safe (not just
+    check-then-act): the DB enforces a partial unique index on
+    (managed_certificate_id, action) restricted to open (non-terminal)
+    statuses (see migration 0010), so even if two concurrent callers both
+    pass the initial SELECT, only one INSERT can win -- the loser catches
+    IntegrityError, rolls back, and re-reads the winner's row.
+
+    Returns (order, created) where `created` is True only when this call
+    actually inserted a new row."""
+    existing = _find_open_order(db, managed_cert, action)
+    if existing is not None:
+        return existing, False
 
     order = LifecycleOrder(
         managed_certificate_id=managed_cert.id,
@@ -58,9 +73,16 @@ def create_order(db: Session, managed_cert: ManagedCertificate, action: str, act
         transitions=[{"from": "", "to": "pending_approval", "at": utcnow().isoformat(), "detail": f"created by {actor}"}],
     )
     db.add(order)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        existing = _find_open_order(db, managed_cert, action)
+        if existing is None:
+            raise
+        return existing, False
     db.refresh(order)
-    return order
+    return order, True
 
 
 def transition(db: Session, order: LifecycleOrder, to_status: str, detail: str = "") -> None:

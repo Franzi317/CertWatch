@@ -877,8 +877,9 @@ def create_lifecycle_order(
     managed_cert = db.get(ManagedCertificate, body.managed_certificate_id)
     if not managed_cert:
         raise HTTPException(404, "managed certificate not found")
-    order = lifecycle.create_order(db, managed_cert, body.action, principal["email"])
-    audit(db, principal["email"], "lifecycle_order.create", "lifecycle_order", order.id, order.action)
+    order, created = lifecycle.create_order(db, managed_cert, body.action, principal["email"])
+    if created:
+        audit(db, principal["email"], "lifecycle_order.create", "lifecycle_order", order.id, order.action)
     db.commit()
     return schemas.LifecycleOrderOut.model_validate(order).model_dump()
 
