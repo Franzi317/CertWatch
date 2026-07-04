@@ -32,8 +32,10 @@ from .db import SessionLocal
 from .deploy.base import CertBundle, DeployError, DeployResult, get_connector
 from .issuers.base import get_adapter
 from .models import (
+    AlertEvent,
     Certificate,
     DeploymentTarget,
+    Endpoint,
     Issuer,
     LifecycleOrder,
     ManagedCertificate,
@@ -66,6 +68,8 @@ def process_one(db) -> bool:
         _process_issuance(db, item)
     elif item.kind == "deploy":
         _process_deploy(db, item)
+    elif item.kind == "verify":
+        _process_verify(db, item)
     else:
         queue.fail(db, item, f"unknown kind: {item.kind}")
 
@@ -227,6 +231,146 @@ def _process_deploy(db, item) -> None:
         queue.fail(db, item, str(e))
     else:
         queue.complete(db, item)
+
+
+def _process_verify(db, item) -> None:
+    """Run the `verify` queue step (Task 12): close the renewal loop by
+    actually observing the newly-issued certificate live before declaring an
+    order complete. A renewal that never gets scanned back (or that's still
+    serving the old cert) must NOT be reported as done.
+
+    Linkage choice: there's no direct FK from `Endpoint`/`DeploymentTarget`
+    to `ManagedCertificate` in the current schema (a `DeploymentTarget`
+    describes *how* to push material, e.g. a filesystem path or keystore --
+    not an observable network endpoint). The simplest correct linkage
+    available is matching `Endpoint.host` against the managed cert's
+    common_name + SANs: that's exactly the FQDN set a scan would have
+    observed this cert under. Good enough for Phase 1; a tighter
+    Endpoint<->ManagedCertificate FK can replace this later if needed.
+
+    Fail-closed on mismatch/scan failure (order -> failed, managed cert ->
+    error, deploy_failed alert raised) and on any unexpected exception. A
+    `RenewalPolicy.verify_after_deploy=False` skips the scan entirely, and a
+    managed cert with NO observable endpoints completes anyway (with a
+    detail noting that) -- ponytail: nothing to scan isn't a reason to fail
+    a renewal that otherwise succeeded.
+    """
+    order_id = item.payload.get("order_id")
+    order = db.get(LifecycleOrder, order_id) if order_id is not None else None
+    if order is None:
+        queue.fail(db, item, f"lifecycle order {order_id!r} not found")
+        return
+
+    if order.status != "verifying":
+        log.info("order %s not in verifying state (status=%s), skipping verify", order.id, order.status)
+        queue.complete(db, item)
+        return
+
+    managed: ManagedCertificate | None = None
+    try:
+        managed = db.get(ManagedCertificate, order.managed_certificate_id)
+        if managed is None:
+            raise RuntimeError(f"managed certificate {order.managed_certificate_id} not found")
+
+        policy = db.get(RenewalPolicy, managed.renewal_policy_id)
+        if policy is None:
+            raise RuntimeError(f"renewal policy {managed.renewal_policy_id} not found")
+
+        cert = db.get(Certificate, managed.current_certificate_id)
+        if cert is None:
+            raise RuntimeError(f"current certificate {managed.current_certificate_id} not found")
+
+        if not policy.verify_after_deploy:
+            _complete_order(db, order, managed, "verification skipped (verify_after_deploy=False)")
+            queue.complete(db, item)
+            return
+
+        endpoints = _endpoints_for_managed_cert(db, managed)
+        if not endpoints:
+            _complete_order(db, order, managed, "complete: no observable endpoints to verify against")
+            queue.complete(db, item)
+            return
+
+        observed_ok = _verify_endpoints_serve(endpoints, cert.fingerprint_sha256, policy.max_retries)
+    except Exception as e:  # noqa: BLE001 - fail-closed: no half-verified order left dangling
+        log.exception("verification crashed for order %s (queue item %s)", order_id, item.id)
+        db.rollback()
+        lifecycle.transition(db, order, "failed", str(e))
+        if managed is not None:
+            managed.state = "error"
+            db.commit()
+        queue.fail(db, item, str(e))
+        return
+
+    if observed_ok:
+        _complete_order(db, order, managed, "")
+        queue.complete(db, item)
+    else:
+        lifecycle.transition(db, order, "failed", "post-deploy verification mismatch")
+        managed.state = "error"
+        db.commit()
+        _raise_deploy_failed_alert(db, managed, order)
+        queue.fail(db, item, "post-deploy verification mismatch")
+
+
+def _complete_order(db, order, managed: ManagedCertificate, detail: str) -> None:
+    lifecycle.transition(db, order, "complete", detail)
+    managed.state = "active"
+    db.commit()
+
+
+def _endpoints_for_managed_cert(db, managed: ManagedCertificate) -> list[Endpoint]:
+    names = {n for n in ([managed.common_name] + list(managed.sans or [])) if n}
+    if not names:
+        return []
+    return db.scalars(select(Endpoint).where(Endpoint.host.in_(names))).all()
+
+
+def _verify_endpoints_serve(endpoints: list[Endpoint], expected_fingerprint: str, max_retries: int) -> bool:
+    """Scan every matching endpoint and require ALL of them to be observed
+    serving the expected (newly-issued) fingerprint. Each endpoint gets up to
+    `max_retries` attempts (a short sleep between) so a cert that hasn't
+    propagated yet (or a transient scan hiccup) isn't immediately treated as
+    a hard failure -- but a scan error is never allowed to crash the worker."""
+    attempts = max(1, max_retries or 1)
+    for ep in endpoints:
+        matched = False
+        for attempt in range(attempts):
+            try:
+                result = scan_engine.scan_endpoint(ep.ip or ep.host, ep.port, sni=ep.host, timeout=5.0)
+            except Exception as e:  # noqa: BLE001 - a scan crash is just another failed attempt
+                log.warning("verify scan errored for %s:%s (attempt %s): %s", ep.host or ep.ip, ep.port, attempt + 1, e)
+                result = None
+            if result is not None and result.status == "ok" and result.cert and result.cert.get("fingerprint_sha256") == expected_fingerprint:
+                matched = True
+                break
+            if attempt + 1 < attempts:
+                time.sleep(0.01)
+        if not matched:
+            return False
+    return True
+
+
+def _raise_deploy_failed_alert(db, managed: ManagedCertificate, order) -> None:
+    """Reuses the AlertEvent/dedupe_key pattern from `app.alerts` (one row
+    per distinct condition, keyed so re-running verify on the same failed
+    order doesn't spam duplicate events) rather than reinventing dispatch --
+    `alerts.dispatch_alerts`/`evaluate_alerts` pick this event up on their
+    normal cadence like any other."""
+    key = f"deploy_failed:{order.id}"
+    if db.scalar(select(AlertEvent).where(AlertEvent.dedupe_key == key)):
+        return
+    db.add(AlertEvent(
+        dedupe_key=key,
+        certificate_id=managed.current_certificate_id,
+        rule_type="deploy_failed",
+        severity="critical",
+        message=(
+            f"Post-deploy verification failed for {managed.common_name or managed.id}: "
+            "the certificate observed live does not match the newly issued certificate."
+        ),
+    ))
+    db.commit()
 
 
 def _split_leaf_and_chain(pem_blob: str) -> tuple[str, str]:
