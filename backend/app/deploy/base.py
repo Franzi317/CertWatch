@@ -9,18 +9,13 @@ dependencies.
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from cryptography import x509
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.serialization import pkcs12
+from .. import crypto_keys
 
 if TYPE_CHECKING:
     from ..models import DeploymentTarget
-
-_PEM_CERT_RE = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.DOTALL)
 
 
 @dataclass
@@ -54,26 +49,12 @@ class CertBundle:
     def pfx_bytes(self, password: str, friendly_name: str = "") -> bytes:
         """Build a PKCS12 (.pfx) blob containing the leaf cert, its private
         key, and any chain certs as CAs. Not used by the `pem` connector
-        (this task) -- implemented now because the `pfx`/`jks`/`iis`
-        connectors (Tasks 10/11) need it and shouldn't have to touch
-        `CertBundle` again."""
-        key = serialization.load_pem_private_key(self.key_pem.encode(), password=None)
-        leaf = x509.load_pem_x509_certificate(self.cert_pem.encode())
-        chain_certs = [
-            x509.load_pem_x509_certificate(block.encode())
-            for block in _PEM_CERT_RE.findall(self.chain_pem)
-        ]
-        encryption = (
-            serialization.BestAvailableEncryption(password.encode())
-            if password
-            else serialization.NoEncryption()
-        )
-        return pkcs12.serialize_key_and_certificates(
-            name=friendly_name.encode() if friendly_name else None,
-            key=key,
-            cert=leaf,
-            cas=chain_certs or None,
-            encryption_algorithm=encryption,
+        (this task) -- used by the `pfx`/`jks` connectors (Task 10) and
+        available for `iis` (Task 11). Delegates to `crypto_keys.build_pkcs12`
+        so the actual PKCS12-building logic lives in one place, reusable
+        outside of `CertBundle` too."""
+        return crypto_keys.build_pkcs12(
+            self.cert_pem, self.chain_pem, self.key_pem, password, friendly_name
         )
 
 
@@ -82,11 +63,19 @@ class DeployConnector(Protocol):
 
 
 def get_connector(target: "DeploymentTarget") -> DeployConnector:
-    """Dispatch on `target.kind`. Only "pem" is implemented so far --
-    "pfx"/"jks"/"iis" are added in Tasks 10/11."""
+    """Dispatch on `target.kind`. "pem"/"pfx"/"jks" are implemented; "iis"
+    is added in Task 11."""
     kind = target.kind
     if kind == "pem":
         from .pem import PemConnector
 
         return PemConnector(target)
+    if kind == "pfx":
+        from .pfx import PfxConnector
+
+        return PfxConnector(target)
+    if kind == "jks":
+        from .jks import JksConnector
+
+        return JksConnector(target)
     raise DeployError(f"connector not implemented: {kind}")

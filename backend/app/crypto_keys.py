@@ -6,15 +6,18 @@ task).
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.x509.oid import NameOID
 
 _RSA_SIZES = {2048, 3072, 4096}
 _ECDSA_CURVES = {256: ec.SECP256R1, 384: ec.SECP384R1}
+_PEM_CERT_RE = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.DOTALL)
 
 
 @dataclass
@@ -72,3 +75,35 @@ def build_csr(key_pem: str, common_name: str, sans: list[str]) -> str:
     )
     csr = builder.sign(key, hashes.SHA256())
     return csr.public_bytes(serialization.Encoding.PEM).decode()
+
+
+def build_pkcs12(
+    cert_pem: str, chain_pem: str, key_pem: str, password: str, friendly_name: str = ""
+) -> bytes:
+    """Build a PKCS12 (.pfx) blob containing the leaf cert, its private key,
+    and any chain certs as CAs. Shared by `deploy.pfx.PfxConnector` and
+    `deploy.jks.JksConnector` (Task 10) -- and by `CertBundle.pfx_bytes`,
+    which delegates here so the PKCS12-building logic lives in one place.
+
+    `key_pem` MUST already be decrypted plaintext; this function never logs
+    it. `password` encrypts the resulting PKCS12 blob itself (distinct from
+    however the caller stored `password` at rest).
+    """
+    key = serialization.load_pem_private_key(key_pem.encode(), password=None)
+    leaf = x509.load_pem_x509_certificate(cert_pem.encode())
+    chain_certs = [
+        x509.load_pem_x509_certificate(block.encode())
+        for block in _PEM_CERT_RE.findall(chain_pem)
+    ]
+    encryption = (
+        serialization.BestAvailableEncryption(password.encode())
+        if password
+        else serialization.NoEncryption()
+    )
+    return pkcs12.serialize_key_and_certificates(
+        name=friendly_name.encode() if friendly_name else None,
+        key=key,
+        cert=leaf,
+        cas=chain_certs or None,
+        encryption_algorithm=encryption,
+    )
