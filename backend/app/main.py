@@ -876,6 +876,13 @@ def list_deployment_targets_for_managed_cert(managed_id: int, db: Session = Depe
 # Lifecycle orders (Task 7): approval-gated issue/renew/revoke state machine
 # --------------------------------------------------------------------------- #
 LIFECYCLE_ACTIONS = {"issue", "renew", "revoke"}
+# Revoke EXECUTION is out of Phase-1 scope (no worker dispatch path, no
+# revoking/revoked states, and AD CS -- the primary CA -- doesn't support it).
+# The two-person-rule governance mechanism in lifecycle.create_order/approve
+# still fully supports revoke orders (e.g. seeded directly for tests or by a
+# future admin tool); this route just refuses to CREATE one via the API so a
+# real order can never get stuck dead-lettered in the work queue.
+CREATABLE_ACTIONS = {"issue", "renew"}
 
 
 @app.get("/api/lifecycle/orders", dependencies=[Depends(require_role("viewer"))])
@@ -900,6 +907,8 @@ def create_lifecycle_order(
 ):
     if body.action not in LIFECYCLE_ACTIONS:
         raise HTTPException(400, f"action must be one of {sorted(LIFECYCLE_ACTIONS)}")
+    if body.action not in CREATABLE_ACTIONS:
+        raise HTTPException(400, "revoke execution is not yet supported")
     managed_cert = db.get(ManagedCertificate, body.managed_certificate_id)
     if not managed_cert:
         raise HTTPException(404, "managed certificate not found")

@@ -23,6 +23,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -331,6 +332,22 @@ class LifecycleOrder(Base):
     transitions: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    # Partial unique index (matches migration 0010_open_order_unique_index
+    # exactly): at most one OPEN (non-terminal) order per
+    # (managed_certificate_id, action). This is what makes
+    # lifecycle.create_order's idempotency race-safe -- declared here too so
+    # SQLite dev/test DBs built via Base.metadata.create_all() get the same
+    # guarantee as Postgres via the Alembic migration.
+    __table_args__ = (
+        Index(
+            "uq_open_lifecycle_order",
+            "managed_certificate_id", "action",
+            unique=True,
+            sqlite_where=text("status NOT IN ('complete','failed','rolled_back')"),
+            postgresql_where=text("status NOT IN ('complete','failed','rolled_back')"),
+        ),
+    )
 
 
 class DeploymentTarget(Base):

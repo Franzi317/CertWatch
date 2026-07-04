@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import pytest
 from conftest import login_as
+from sqlalchemy import inspect
+from sqlalchemy.exc import IntegrityError
 
 from app import lifecycle, queue
-from app.models import Certificate, Issuer, ManagedCertificate, RenewalPolicy, WorkQueue, utcnow
+from app.models import Certificate, Issuer, LifecycleOrder, ManagedCertificate, RenewalPolicy, WorkQueue, utcnow
 
 POLICY = {
     "name": "default-90d",
@@ -95,6 +97,36 @@ def test_create_order_race_safe_after_terminal_via_unique_index(db):
     second, second_created = lifecycle.create_order(db, m, "renew", "alice@test.local")
     assert second_created is True
     assert second.id != first.id
+
+
+def test_open_order_unique_index_present_on_create_all(db):
+    """Finding 2: models.LifecycleOrder now declares the same partial unique
+    index as migration 0010, so Base.metadata.create_all (SQLite dev/test)
+    builds it too -- confirm it actually exists on the table."""
+    indexes = inspect(db.get_bind()).get_indexes("lifecycle_orders")
+    names = {idx["name"] for idx in indexes}
+    assert "uq_open_lifecycle_order" in names
+
+
+def test_open_order_unique_index_enforced_bypassing_create_order(db):
+    """Prove the index is a real DB-level guarantee, not just create_order's
+    pre-check: insert two OPEN orders for the same (managed_cert, action)
+    directly via db.add, bypassing create_order entirely, and confirm the
+    second raises IntegrityError."""
+    m = _managed_cert(db)
+    db.add(LifecycleOrder(
+        managed_certificate_id=m.id, action="renew", status="pending_approval",
+        correlation_id="c1", transitions=[],
+    ))
+    db.commit()
+
+    db.add(LifecycleOrder(
+        managed_certificate_id=m.id, action="renew", status="approved",
+        correlation_id="c2", transitions=[],
+    ))
+    with pytest.raises(IntegrityError):
+        db.commit()
+    db.rollback()
 
 
 def test_approve_renew_by_operator_queues_and_enqueues_work(db):
@@ -240,13 +272,17 @@ def test_create_order_missing_managed_cert_404(client, monkeypatch, db):
 
 
 def test_approve_revoke_order_as_operator_403_as_admin_ok(client, monkeypatch, db):
+    # Revoke orders can no longer be created via the API route (Finding 1:
+    # revoke execution isn't wired up in the worker), so this seeds the order
+    # directly through lifecycle.create_order -- the mechanism itself still
+    # fully supports revoke -- to keep exercising the two-person-rule
+    # governance in lifecycle.approve / the /approve route end to end.
     m = _managed_cert(db)
+    order, _ = lifecycle.create_order(db, m, "revoke", "alice@test.local")
     db.commit()
+    order_id = order.id
 
     login_as(client, "operator", monkeypatch)
-    r = client.post("/api/lifecycle/orders", json={"managed_certificate_id": m.id, "action": "revoke"})
-    order_id = r.json()["id"]
-
     r = client.post(f"/api/lifecycle/orders/{order_id}/approve")
     assert r.status_code == 403, r.text
 
@@ -254,6 +290,22 @@ def test_approve_revoke_order_as_operator_403_as_admin_ok(client, monkeypatch, d
     r = client.post(f"/api/lifecycle/orders/{order_id}/approve")
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "queued"
+
+
+def test_create_revoke_order_via_route_400(client, monkeypatch, db):
+    """Finding 1: revoke has no worker execution path, so the API must
+    refuse to create one -- the two-person-rule mechanism in
+    lifecycle.create_order/approve is untouched and still exercised above
+    via a directly-seeded order."""
+    m = _managed_cert(db)
+    db.commit()
+    login_as(client, "operator", monkeypatch)
+
+    r = client.post("/api/lifecycle/orders", json={"managed_certificate_id": m.id, "action": "revoke"})
+    assert r.status_code == 400, r.text
+
+    r = client.get("/api/lifecycle/orders")
+    assert r.json() == []
 
 
 def test_reject_order_route(client, monkeypatch, db):
