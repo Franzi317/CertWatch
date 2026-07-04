@@ -21,9 +21,20 @@ class NotifyError(Exception):
     pass
 
 
-def send_email(config: dict, subject: str, body_text: str, body_html: str | None = None) -> None:
+def send_email(
+    config: dict,
+    subject: str,
+    body_text: str,
+    body_html: str | None = None,
+    attachments: list[tuple[str, str]] | None = None,
+) -> None:
     """config keys: host, port, use_tls, use_starttls, username, password,
-    from_address, recipients (list)."""
+    from_address, recipients (list).
+
+    `attachments` (Phase 2, Task 5) is an optional list of (filename,
+    text_content) pairs -- e.g. a scheduled report's CSV -- attached as
+    text/csv parts. Defaults to None so existing callers are unaffected.
+    """
     host = config.get("host")
     port = int(config.get("port", 587))
     recipients = config.get("recipients") or []
@@ -39,6 +50,8 @@ def send_email(config: dict, subject: str, body_text: str, body_html: str | None
     msg.set_content(body_text)
     if body_html:
         msg.add_alternative(body_html, subtype="html")
+    for fname, content in (attachments or []):
+        msg.add_attachment(content.encode(), maintype="text", subtype="csv", filename=fname)
 
     context = ssl.create_default_context()
     try:

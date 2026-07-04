@@ -423,6 +423,34 @@ class Finding(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class ReportSchedule(Base):
+    """A recurring CSV report (Phase 2, Task 5): `reports.render` projects
+    `report_type` (scoped by `filter_params`) to CSV on a calendar `cadence`
+    and emails it through the referenced SMTP `NotificationChannel`.
+    Ticked by `scheduler.report_tick` (reuses the same calendar-schedule
+    helpers as Target's schedule_type), executed by
+    `worker._process_report` -> `reports.run_schedule`."""
+
+    __tablename__ = "report_schedules"
+    __table_args__ = (Index("ix_report_schedules_enabled", "enabled"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    # report_type: certificates | expiring | findings | endpoints
+    report_type: Mapped[str] = mapped_column(String(32))
+    filter_params: Mapped[dict] = mapped_column(JSON, default=dict)
+    format: Mapped[str] = mapped_column(String(8), default="csv")
+    recipients: Mapped[list] = mapped_column(JSON, default=list)
+    channel_id: Mapped[int] = mapped_column(ForeignKey("notification_channels.id"))
+    # cadence: daily | weekly | monthly
+    cadence: Mapped[str] = mapped_column(String(16), default="daily")
+    schedule_time: Mapped[str] = mapped_column(String(5), default="08:00")
+    schedule_day: Mapped[int] = mapped_column(Integer, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     __table_args__ = (Index("ix_audit_logs_created_at", "created_at"),)

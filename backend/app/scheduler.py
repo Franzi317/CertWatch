@@ -16,7 +16,16 @@ from sqlalchemy import select
 from . import alerts, lifecycle, queue
 from .config import settings
 from .db import SessionLocal
-from .models import Certificate, LifecycleOrder, ManagedCertificate, RenewalPolicy, ScanJob, Target, utcnow
+from .models import (
+    Certificate,
+    LifecycleOrder,
+    ManagedCertificate,
+    ReportSchedule,
+    RenewalPolicy,
+    ScanJob,
+    Target,
+    utcnow,
+)
 
 log = logging.getLogger("certwatch.scheduler")
 _scheduler: BackgroundScheduler | None = None
@@ -183,6 +192,37 @@ def order_stuck_tick() -> None:
         db.close()
 
 
+def report_due(schedule: ReportSchedule, now_utc: datetime) -> bool:
+    """True if `schedule` should run now. Same calendar-window logic as
+    `schedule_due`'s calendar branch (daily/weekly/monthly), but keyed off
+    `last_run_at` instead of `last_scanned_at` -- ReportSchedule has no
+    "interval" cadence, only calendar ones."""
+    last = _aware(schedule.last_run_at) if schedule.last_run_at else None
+    hh, mm = _parse_hhmm(getattr(schedule, "schedule_time", "08:00"))
+    now_local = now_utc.astimezone(settings.tzinfo)
+    occ = _last_occurrence(schedule.cadence, hh, mm, getattr(schedule, "schedule_day", 0) or 0, now_local)
+    if occ is None:
+        return False
+    occ_utc = occ.astimezone(timezone.utc)
+    return last is None or last < occ_utc
+
+
+def report_tick() -> None:
+    db = SessionLocal()
+    try:
+        now = utcnow()
+        schedules = db.scalars(select(ReportSchedule).where(ReportSchedule.enabled.is_(True))).all()
+        for s in schedules:
+            if not report_due(s, now):
+                continue
+            queue.enqueue(db, "report", {"schedule_id": s.id})
+            log.info("scheduled report enqueued: %s", s.name)
+    except Exception:
+        log.exception("report tick failed")
+    finally:
+        db.close()
+
+
 def start_scheduler() -> None:
     global _scheduler
     if _scheduler is not None:
@@ -191,6 +231,7 @@ def start_scheduler() -> None:
     _scheduler.add_job(_tick, "interval", minutes=1, id="scan_tick", max_instances=1)
     _scheduler.add_job(renewal_tick, "interval", hours=24, id="renewal_tick", max_instances=1)
     _scheduler.add_job(order_stuck_tick, "interval", minutes=5, id="order_stuck_tick", max_instances=1)
+    _scheduler.add_job(report_tick, "interval", minutes=1, id="report_tick", max_instances=1)
     _scheduler.start()
     log.info("scheduler started")
 

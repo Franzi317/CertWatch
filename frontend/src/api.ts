@@ -130,3 +130,9 @@ export interface Finding {
   created_at: string; updated_at: string;
 }
 export interface FindingList { total: number; items: Finding[]; }
+export interface ReportSchedule {
+  id: number; name: string; report_type: string; filter_params: Record<string, any>;
+  format: string; recipients: string[]; channel_id: number; cadence: string;
+  schedule_time: string; schedule_day: number; enabled: boolean;
+  last_run_at: string | null; created_at: string;
+}

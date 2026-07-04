@@ -18,7 +18,7 @@ from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import findings, lifecycle, schemas, targets as target_lib
+from . import findings, lifecycle, queue, schemas, targets as target_lib
 from .alerts import dispatch_alerts, evaluate_alerts
 from .auth import require_role, router as auth_router
 from .config import settings
@@ -40,6 +40,7 @@ from .models import (
     ManagedCertificate,
     NotificationChannel,
     RenewalPolicy,
+    ReportSchedule,
     ScanJob,
     SystemSetting,
     Target,
@@ -1174,6 +1175,97 @@ def list_audit(
         return Response(content=csv_text, media_type="text/csv",
                          headers={"Content-Disposition": 'attachment; filename="audit.csv"'})
     return {"total": total, "items": items}
+
+
+# --------------------------------------------------------------------------- #
+# Scheduled reports (Phase 2, Task 5)
+# --------------------------------------------------------------------------- #
+def report_dict(s: ReportSchedule) -> dict:
+    return {
+        "id": s.id,
+        "name": s.name,
+        "report_type": s.report_type,
+        "filter_params": s.filter_params,
+        "format": s.format,
+        "recipients": s.recipients,
+        "channel_id": s.channel_id,
+        "cadence": s.cadence,
+        "schedule_time": s.schedule_time,
+        "schedule_day": s.schedule_day,
+        "enabled": s.enabled,
+        "last_run_at": s.last_run_at,
+        "created_at": s.created_at,
+    }
+
+
+@app.get("/api/reports", dependencies=[Depends(require_role("viewer"))])
+def list_reports(db: Session = Depends(get_db)):
+    rows = db.scalars(select(ReportSchedule).order_by(ReportSchedule.id.desc())).all()
+    return [report_dict(s) for s in rows]
+
+
+@app.post("/api/reports", status_code=201)
+def create_report(
+    body: schemas.ReportScheduleIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    if not db.get(NotificationChannel, body.channel_id):
+        raise HTTPException(400, "notification channel not found")
+    s = ReportSchedule(**body.model_dump())
+    db.add(s)
+    db.flush()
+    audit(db, principal["email"], "report.create", "report", s.id, s.name)
+    db.commit()
+    return report_dict(s)
+
+
+@app.put("/api/reports/{report_id}")
+def update_report(
+    report_id: int,
+    body: schemas.ReportScheduleIn,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    s = db.get(ReportSchedule, report_id)
+    if not s:
+        raise HTTPException(404, "report schedule not found")
+    if not db.get(NotificationChannel, body.channel_id):
+        raise HTTPException(400, "notification channel not found")
+    for k, v in body.model_dump().items():
+        setattr(s, k, v)
+    audit(db, principal["email"], "report.update", "report", s.id, s.name)
+    db.commit()
+    return report_dict(s)
+
+
+@app.delete("/api/reports/{report_id}", status_code=204)
+def delete_report(
+    report_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    s = db.get(ReportSchedule, report_id)
+    if not s:
+        raise HTTPException(404, "report schedule not found")
+    audit(db, principal["email"], "report.delete", "report", s.id, s.name)
+    db.delete(s)
+    db.commit()
+
+
+@app.post("/api/reports/{report_id}/run")
+def run_report(
+    report_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = Depends(require_role("operator")),
+):
+    s = db.get(ReportSchedule, report_id)
+    if not s:
+        raise HTTPException(404, "report schedule not found")
+    queue.enqueue(db, "report", {"schedule_id": s.id})
+    audit(db, principal["email"], "report.run", "report", s.id, s.name)
+    db.commit()
+    return {"queued": True}
 
 
 # --------------------------------------------------------------------------- #

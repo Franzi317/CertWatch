@@ -9,6 +9,7 @@ import EndpointDetail from "./pages/EndpointDetail";
 import ScanJobs from "./pages/ScanJobs";
 import Alerts from "./pages/Alerts";
 import Findings from "./pages/Findings";
+import Reports from "./pages/Reports";
 import Issuers from "./pages/Issuers";
 import ManagedCerts from "./pages/ManagedCerts";
 import Orders from "./pages/Orders";
@@ -25,6 +26,7 @@ const nav = [
   ["/scans", "Scan Jobs"],
   ["/alerts", "Alerts"],
   ["/findings", "Findings"],
+  ["/reports", "Reports"],
   ["/issuers", "Issuers"],
   ["/managed-certificates", "Managed Certs"],
   ["/orders", "Orders"],
@@ -101,6 +103,7 @@ function AppShell() {
           <Route path="/scans" element={<ScanJobs />} />
           <Route path="/alerts" element={<Alerts />} />
           <Route path="/findings" element={<Findings />} />
+          <Route path="/reports" element={<Reports />} />
           <Route path="/issuers" element={<Issuers />} />
           <Route path="/managed-certificates" element={<ManagedCerts />} />
           <Route path="/orders" element={<Orders />} />

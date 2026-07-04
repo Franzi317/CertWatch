@@ -26,7 +26,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from sqlalchemy import select
 
-from . import alerts, lifecycle, queue, scan_engine, secrets
+from . import alerts, lifecycle, queue, reports, scan_engine, secrets
 from .crypto_keys import build_csr, generate_private_key
 from .db import SessionLocal
 from .deploy.base import CertBundle, DeployError, DeployResult, get_connector
@@ -38,6 +38,7 @@ from .models import (
     Issuer,
     LifecycleOrder,
     ManagedCertificate,
+    ReportSchedule,
     RenewalPolicy,
     utcnow,
 )
@@ -69,10 +70,31 @@ def process_one(db) -> bool:
         _process_deploy(db, item)
     elif item.kind == "verify":
         _process_verify(db, item)
+    elif item.kind == "report":
+        _process_report(db, item)
     else:
         queue.fail(db, item, f"unknown kind: {item.kind}")
 
     return True
+
+
+def _process_report(db, item) -> None:
+    """Run the `report` queue step (Task 5): render + email the referenced
+    ReportSchedule via `reports.run_schedule`. Any failure (missing schedule,
+    missing/wrong-type channel, SMTP error) fails the queue item closed --
+    never lets a bad report kill the worker."""
+    schedule_id = item.payload.get("schedule_id")
+    schedule = db.get(ReportSchedule, schedule_id) if schedule_id is not None else None
+    if schedule is None:
+        queue.fail(db, item, f"report schedule {schedule_id!r} not found")
+        return
+    try:
+        reports.run_schedule(db, schedule)
+    except Exception as e:  # noqa: BLE001 - any report failure must not kill the worker
+        log.exception("report schedule failed (queue item %s)", item.id)
+        queue.fail(db, item, str(e))
+    else:
+        queue.complete(db, item)
 
 
 def _process_issuance(db, item) -> None:

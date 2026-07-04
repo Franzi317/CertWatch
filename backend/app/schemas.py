@@ -153,6 +153,19 @@ class FindingDispositionIn(BaseModel):
     note: str | None = None
 
 
+class ReportScheduleIn(BaseModel):
+    name: str
+    report_type: Literal["certificates", "expiring", "findings", "endpoints"]
+    filter_params: dict = Field(default_factory=dict)
+    format: str = "csv"
+    recipients: list[str] = Field(default_factory=list)
+    channel_id: int
+    cadence: Literal["daily", "weekly", "monthly"]
+    schedule_time: str = "08:00"
+    schedule_day: int = 0
+    enabled: bool = True
+
+
 class LifecycleOrderIn(BaseModel):
     managed_certificate_id: int
     action: str  # issue | renew | revoke
