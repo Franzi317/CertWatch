@@ -24,6 +24,7 @@ from .models import (
     RenewalPolicy,
     ScanJob,
     Target,
+    WorkQueue,
     utcnow,
 )
 
@@ -212,8 +213,19 @@ def report_tick() -> None:
     try:
         now = utcnow()
         schedules = db.scalars(select(ReportSchedule).where(ReportSchedule.enabled.is_(True))).all()
+        # skip schedules with an already in-flight "report" item -- report_due()
+        # only flips False once the worker sets last_run_at, so without this a
+        # backlogged/down worker would get the same schedule re-enqueued every
+        # minute (mirrors _tick()'s active-ScanJob check above).
+        # ponytail: full scan of open report items each tick is fine at this scale.
+        pending = db.scalars(select(WorkQueue).where(
+            WorkQueue.kind == "report", WorkQueue.status.in_(["queued", "leased"]),
+        )).all()
+        inflight_ids = {w.payload.get("schedule_id") for w in pending}
         for s in schedules:
             if not report_due(s, now):
+                continue
+            if s.id in inflight_ids:
                 continue
             queue.enqueue(db, "report", {"schedule_id": s.id})
             log.info("scheduled report enqueued: %s", s.name)

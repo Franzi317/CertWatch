@@ -178,3 +178,25 @@ def test_report_tick_enqueues_due_schedule_and_skips_not_due(db):
     schedule_ids = {i.payload["schedule_id"] for i in items}
     assert due.id in schedule_ids
     assert not_due.id not in schedule_ids
+
+
+def test_report_tick_does_not_duplicate_enqueue_when_worker_backlogged(db):
+    """If the worker hasn't processed the previous tick's item yet,
+    `last_run_at` is still unset, so `report_due` stays True -- report_tick
+    must not enqueue a second `report` item for the same schedule."""
+    from app import scheduler
+
+    ch = _channel(db)
+    due = ReportSchedule(
+        name="due", report_type="certificates", cadence="daily", schedule_time="00:00",
+        channel_id=ch.id, enabled=True, last_run_at=None,
+    )
+    db.add(due)
+    db.commit()
+
+    scheduler.report_tick()
+    scheduler.report_tick()
+
+    items = db.query(WorkQueue).filter_by(kind="report").all()
+    matching = [i for i in items if i.payload.get("schedule_id") == due.id]
+    assert len(matching) == 1
