@@ -26,7 +26,8 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from sqlalchemy import select
 
-from . import alerts, lifecycle, queue, reports, scan_engine, secrets
+from . import alerts, ct_source, findings, lifecycle, queue, reports, scan_engine, secrets
+from .config import settings
 from .crypto_keys import build_csr, generate_private_key
 from .db import SessionLocal
 from .deploy.base import CertBundle, DeployError, DeployResult, get_connector
@@ -40,6 +41,7 @@ from .models import (
     ManagedCertificate,
     ReportSchedule,
     RenewalPolicy,
+    WatchedDomain,
     utcnow,
 )
 from .scanner import parse_certificate
@@ -72,6 +74,8 @@ def process_one(db) -> bool:
         _process_verify(db, item)
     elif item.kind == "report":
         _process_report(db, item)
+    elif item.kind == "ct_check":
+        _process_ct_check(db, item)
     else:
         queue.fail(db, item, f"unknown kind: {item.kind}")
 
@@ -92,6 +96,54 @@ def _process_report(db, item) -> None:
         reports.run_schedule(db, schedule)
     except Exception as e:  # noqa: BLE001 - any report failure must not kill the worker
         log.exception("report schedule failed (queue item %s)", item.id)
+        queue.fail(db, item, str(e))
+    else:
+        queue.complete(db, item)
+
+
+def _process_ct_check(db, item) -> None:
+    """Run the `ct_check` queue step (Phase 2.5): poll the CT source for one
+    WatchedDomain, ingest any cert whose fingerprint isn't already in inventory
+    as source="ct", and run the findings engine so unknown_issuance fires.
+    Advances the domain's crt.sh high-water mark. Fail-closed: any error fails
+    the queue item (retry/backoff) and never crashes the worker."""
+    domain_id = item.payload.get("domain_id")
+    domain = db.get(WatchedDomain, domain_id) if domain_id is not None else None
+    if domain is None:
+        queue.fail(db, item, f"watched domain {domain_id!r} not found")
+        return
+    if not settings.ct_source_url:
+        # feature disabled after this item was enqueued -- nothing to do
+        queue.complete(db, item)
+        return
+    try:
+        entries = ct_source.list_entries(settings.ct_source_url, domain.domain)
+        watermark = domain.last_crtsh_id or 0
+        max_id = watermark
+        for entry in entries:
+            eid = entry.get("id")
+            if eid is None or eid <= watermark:
+                continue
+            max_id = max(max_id, eid)
+            der = ct_source.fetch_der(settings.ct_source_url, eid)
+            fields = parse_certificate(der)
+            existing = db.scalar(
+                select(Certificate).where(
+                    Certificate.fingerprint_sha256 == fields["fingerprint_sha256"]
+                )
+            )
+            cert = scan_engine._upsert_certificate(db, fields, source="ct")
+            db.flush()
+            # Only run findings for a genuinely new CT cert (unbound). A
+            # fingerprint already in inventory is network-known -> no finding.
+            if existing is None:
+                findings.evaluate_certificate(db, cert, endpoint=None)
+        domain.last_crtsh_id = max_id
+        domain.last_checked_at = utcnow()
+        db.commit()
+    except Exception as e:  # noqa: BLE001 - any CT failure must not kill the worker
+        log.exception("ct_check failed for domain %s (queue item %s)", domain_id, item.id)
+        db.rollback()
         queue.fail(db, item, str(e))
     else:
         queue.complete(db, item)
