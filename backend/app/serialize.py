@@ -31,6 +31,7 @@ def cert_dict(db: Session, cert: Certificate, with_endpoints: bool = False) -> d
         "is_wildcard": cert.is_wildcard,
         "is_ca": cert.is_ca,
         "chain_length": cert.chain_length,
+        "source": cert.source,
         "first_seen": cert.first_seen,
         "last_seen": cert.last_seen,
         "days_until_expiry": days,
