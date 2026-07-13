@@ -127,6 +127,22 @@ target's frequency.
 | **Healthy** | More than 90 days out |
 | **Unknown** | Scan failed or data incomplete |
 
+### Certificate Transparency monitoring
+
+**Settings → Watched domains (CT monitoring).** Add a domain (e.g. `example.com`) and
+CertWatch periodically polls a CT log source (crt.sh-compatible) for certificates
+issued for that domain or its subdomains — including ones CertWatch never scanned
+directly. Matching certificates are imported with `source=ct` and shown with a **CT**
+badge in the Certificates inventory (filterable via the `source=ct` view); this
+surfaces shadow IT or unsanctioned CA issuance that network scanning alone would miss.
+
+A CT-discovered certificate that has never been observed on any scanned endpoint
+raises an `unknown_issuance` finding instead of an expiry/health alert, since
+CertWatch doesn't control or operate that certificate. Dashboard expiry/health tiles
+(expiring soon, expired) only count network-observed (`source=network`) certificates,
+so CT-only certs never inflate those operational counts — they're tracked via the
+finding instead.
+
 ---
 
 ## How alerting works
@@ -210,7 +226,10 @@ Interactive docs at `/docs` (Swagger UI).
 
 See `.env.example`. Key ones: `CERTWATCH_DATABASE_URL`, `CERTWATCH_API_KEY`,
 `CERTWATCH_MAX_CIDR_HOSTS`, `CERTWATCH_DEFAULT_TIMEOUT`, `CERTWATCH_DEFAULT_CONCURRENCY`,
-`CERTWATCH_ENABLE_SCHEDULER`, `CERTWATCH_STATIC_DIR`.
+`CERTWATCH_ENABLE_SCHEDULER`, `CERTWATCH_STATIC_DIR`, `CERTWATCH_CT_SOURCE_URL` (CT log
+source base URL; blank disables CT monitoring, default `https://crt.sh`),
+`CERTWATCH_CT_CHECK_FREQUENCY_HOURS` (default `24`), `CERTWATCH_CT_FINDING_SEVERITY`
+(severity of the `unknown_issuance` finding, default `warning`).
 
 ## Known limitations
 

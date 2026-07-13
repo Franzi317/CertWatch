@@ -1424,11 +1424,16 @@ def dashboard(db: Session = Depends(get_db)):
     total_certs = db.scalar(select(func.count(Certificate.id))) or 0
     total_endpoints = db.scalar(select(func.count(Endpoint.id))) or 0
 
+    # ponytail: dashboard operational tiles count network-observed certs only;
+    # CT-discovered shadow certs surface via the unknown_issuance finding, not
+    # these tiles, so they don't inflate expiry/health metrics.
     def count_window(days):
         return db.scalar(select(func.count(Certificate.id)).where(
+            Certificate.source == "network",
             Certificate.not_after >= now, Certificate.not_after <= now + timedelta(days=days))) or 0
 
-    expired = db.scalar(select(func.count(Certificate.id)).where(Certificate.not_after < now)) or 0
+    expired = db.scalar(select(func.count(Certificate.id)).where(
+        Certificate.source == "network", Certificate.not_after < now)) or 0
     failed = db.scalar(select(func.count(Endpoint.id)).where(
         Endpoint.last_status != "ok", Endpoint.last_status != "")) or 0
     changed = db.scalar(select(func.count(CertificateObservation.id)).where(
