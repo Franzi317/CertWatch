@@ -29,6 +29,7 @@ EXPIRING_THRESHOLD_DAYS = 30
 ENDPOINT_SCOPED_RULE_IDS = {"self_signed_prod", "untrusted_issuer_prod"}
 ALL_RULE_IDS = ENDPOINT_SCOPED_RULE_IDS | {
     "weak_key", "deprecated_signature", "long_lifetime", "expiring", "expired",
+    "unknown_issuance",
 }
 
 
@@ -121,6 +122,25 @@ def _expiring(cert: Certificate, now: datetime) -> dict | None:
     )
 
 
+def _unknown_issuance(cert: Certificate, endpoint: Endpoint | None) -> dict | None:
+    # Fires only for a CT-discovered cert not currently bound to any endpoint.
+    # evaluate_certificate runs with endpoint=None exactly for certs no Endpoint
+    # references (see evaluate_all), so "endpoint is None" == "unbound" here --
+    # no extra query. When a scan later binds this fingerprint to an endpoint,
+    # this cert is re-evaluated WITH an endpoint, the candidate disappears, and
+    # the existing active->cleared logic clears the finding.
+    if cert.source != "ct" or endpoint is not None:
+        return None
+    return _candidate(
+        "unknown_issuance", settings.ct_finding_severity,
+        f"Certificate found in CT logs but not on the network ({cert.common_name or cert.fingerprint_sha256})",
+        f"Certificate {cert.common_name or cert.fingerprint_sha256} (issuer '{cert.issuer}') was "
+        f"discovered in a Certificate Transparency log for a watched domain but has never been "
+        f"observed on any scanned endpoint. Possible shadow IT, unsanctioned CA issuance, or a "
+        f"forgotten/external service.",
+    )
+
+
 def _self_signed_prod(cert: Certificate, target: Target | None) -> dict | None:
     if target is None or not cert.self_signed or target.environment != "prod":
         return None
@@ -165,6 +185,7 @@ def evaluate_certificate(db: Session, cert: Certificate, endpoint: Endpoint | No
         _long_lifetime(cert, th),
         _expired(cert, now),
         _expiring(cert, now),
+        _unknown_issuance(cert, endpoint),
     ) if c]
 
     if endpoint is not None:

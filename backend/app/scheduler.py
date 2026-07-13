@@ -24,6 +24,7 @@ from .models import (
     RenewalPolicy,
     ScanJob,
     Target,
+    WatchedDomain,
     WorkQueue,
     utcnow,
 )
@@ -235,6 +236,36 @@ def report_tick() -> None:
         db.close()
 
 
+def ct_tick() -> None:
+    """Phase 2.5: enqueue a `ct_check` for every enabled WatchedDomain whose
+    cadence (CERTWATCH_CT_CHECK_FREQUENCY_HOURS) has elapsed and that has no
+    in-flight ct_check item. No-op when CT monitoring is disabled
+    (CERTWATCH_CT_SOURCE_URL blank). Mirrors report_tick's in-flight guard."""
+    if not settings.ct_source_url:
+        return
+    db = SessionLocal()
+    try:
+        now = utcnow()
+        cadence = timedelta(hours=settings.ct_check_frequency_hours)
+        pending = db.scalars(select(WorkQueue).where(
+            WorkQueue.kind == "ct_check", WorkQueue.status.in_(["queued", "leased"]),
+        )).all()
+        inflight_ids = {w.payload.get("domain_id") for w in pending}
+        domains = db.scalars(select(WatchedDomain).where(WatchedDomain.enabled.is_(True))).all()
+        for d in domains:
+            last = _aware(d.last_checked_at) if d.last_checked_at else None
+            if last is not None and now - last < cadence:
+                continue
+            if d.id in inflight_ids:
+                continue
+            queue.enqueue(db, "ct_check", {"domain_id": d.id})
+            log.info("ct_check enqueued for watched domain %s", d.domain)
+    except Exception:
+        log.exception("ct tick failed")
+    finally:
+        db.close()
+
+
 def start_scheduler() -> None:
     global _scheduler
     if _scheduler is not None:
@@ -244,6 +275,7 @@ def start_scheduler() -> None:
     _scheduler.add_job(renewal_tick, "interval", hours=24, id="renewal_tick", max_instances=1)
     _scheduler.add_job(order_stuck_tick, "interval", minutes=5, id="order_stuck_tick", max_instances=1)
     _scheduler.add_job(report_tick, "interval", minutes=1, id="report_tick", max_instances=1)
+    _scheduler.add_job(ct_tick, "interval", hours=1, id="ct_tick", max_instances=1)
     _scheduler.start()
     log.info("scheduler started")
 

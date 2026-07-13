@@ -26,7 +26,8 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from sqlalchemy import select
 
-from . import alerts, lifecycle, queue, reports, scan_engine, secrets
+from . import alerts, ct_source, findings, lifecycle, queue, reports, scan_engine, secrets
+from .config import settings
 from .crypto_keys import build_csr, generate_private_key
 from .db import SessionLocal
 from .deploy.base import CertBundle, DeployError, DeployResult, get_connector
@@ -40,6 +41,7 @@ from .models import (
     ManagedCertificate,
     ReportSchedule,
     RenewalPolicy,
+    WatchedDomain,
     utcnow,
 )
 from .scanner import parse_certificate
@@ -72,6 +74,8 @@ def process_one(db) -> bool:
         _process_verify(db, item)
     elif item.kind == "report":
         _process_report(db, item)
+    elif item.kind == "ct_check":
+        _process_ct_check(db, item)
     else:
         queue.fail(db, item, f"unknown kind: {item.kind}")
 
@@ -95,6 +99,76 @@ def _process_report(db, item) -> None:
         queue.fail(db, item, str(e))
     else:
         queue.complete(db, item)
+
+
+def _process_ct_check(db, item) -> None:
+    """Run the `ct_check` queue step (Phase 2.5): poll the CT source for one
+    WatchedDomain, ingest any cert whose fingerprint isn't already in inventory
+    as source="ct", and run the findings engine so unknown_issuance fires.
+    Advances the domain's crt.sh high-water mark after each entry (durable
+    progress). Fail-closed only at the `list_entries` network boundary -- a
+    per-entry `fetch_der`/`parse_certificate` error is logged and skipped so
+    one poison entry can't stall every newer entry behind it."""
+    domain_id = item.payload.get("domain_id")
+    domain = db.get(WatchedDomain, domain_id) if domain_id is not None else None
+    if domain is None:
+        queue.fail(db, item, f"watched domain {domain_id!r} not found")
+        return
+    if not settings.ct_source_url:
+        # feature disabled after this item was enqueued -- nothing to do
+        queue.complete(db, item)
+        return
+
+    try:
+        entries = ct_source.list_entries(settings.ct_source_url, domain.domain)
+    except Exception as e:  # noqa: BLE001 - the list call is the network boundary; fail closed
+        log.exception("ct_check list_entries failed for domain %s (queue item %s)", domain_id, item.id)
+        db.rollback()
+        queue.fail(db, item, str(e))
+        return
+
+    watermark = domain.last_crtsh_id or 0
+    # Ascending by id so the per-entry watermark write is always monotonic; cap
+    # the batch so a large first sync can't outrun the queue lease or hammer crt.sh.
+    new_entries = sorted(
+        (e for e in entries if e.get("id") is not None and e["id"] > watermark),
+        key=lambda e: e["id"],
+    )[: settings.ct_max_entries_per_run]
+
+    for entry in new_entries:
+        eid = entry["id"]
+        try:
+            der = ct_source.fetch_der(settings.ct_source_url, eid)
+            fields = parse_certificate(der)
+            existing = db.scalar(
+                select(Certificate).where(
+                    Certificate.fingerprint_sha256 == fields["fingerprint_sha256"]
+                )
+            )
+            cert = scan_engine._upsert_certificate(db, fields, source="ct")
+            db.flush()
+            if existing is None:
+                findings.evaluate_certificate(db, cert, endpoint=None)
+        except Exception as e:  # noqa: BLE001 - one bad entry must not stall the whole domain
+            # ponytail: a bad OR transiently-failing entry is skipped and the
+            # watermark still advances past it, so a single poison entry (malformed
+            # DER, precert, crt.sh HTML error) can't blackhole every newer entry.
+            # Trade-off: a transient fetch error skips that one cert permanently
+            # (it will not re-appear under the same id). Add a retry/dead-letter
+            # list only if that miss rate ever matters.
+            log.warning("ct_check: skipping entry id=%s for %s: %s", eid, domain.domain, e)
+            db.rollback()
+        # Advance and persist the watermark past this entry regardless of outcome.
+        domain.last_crtsh_id = eid
+        domain.last_checked_at = utcnow()
+        db.commit()
+
+    if not new_entries:
+        # nothing new, but record that the check ran
+        domain.last_checked_at = utcnow()
+        db.commit()
+
+    queue.complete(db, item)
 
 
 def _process_issuance(db, item) -> None:

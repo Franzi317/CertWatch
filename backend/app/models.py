@@ -132,6 +132,11 @@ class Certificate(Base):
     is_wildcard: Mapped[bool] = mapped_column(Boolean, default=False)
     is_ca: Mapped[bool] = mapped_column(Boolean, default=False)
     chain_length: Mapped[int] = mapped_column(Integer, default=1)
+    # network = observed on our network via a scan; ct = discovered in a
+    # Certificate Transparency log for a WatchedDomain. ponytail: provenance of
+    # first discovery only -- NOT flipped when a ct cert is later scanned; the
+    # unknown_issuance finding clears off endpoint binding instead (findings.py).
+    source: Mapped[str] = mapped_column(String(16), default="network")
     pem: Mapped[str] = mapped_column(Text, default="")
     first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -448,6 +453,23 @@ class ReportSchedule(Base):
     schedule_day: Mapped[int] = mapped_column(Integer, default=0)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class WatchedDomain(Base):
+    """A domain polled against a Certificate Transparency source (crt.sh) to
+    find publicly-issued certs CertWatch never observed on its own network.
+    Just the poll list -- discovered certs/findings are not FK'd to it.
+    Ticked by `scheduler.ct_tick`, executed by `worker._process_ct_check`."""
+
+    __tablename__ = "watched_domains"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    domain: Mapped[str] = mapped_column(String(255))  # e.g. example.com; queried as %.example.com
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # high-water mark: max crt.sh entry id already processed for this domain.
+    last_crtsh_id: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

@@ -47,6 +47,7 @@ from .models import (
     ScanJob,
     SystemSetting,
     Target,
+    WatchedDomain,
     utcnow,
 )
 from .metrics import setup_metrics
@@ -334,6 +335,7 @@ def list_certificates(
     self_signed: bool | None = None,
     internal: bool | None = None,
     issuer: str = "",
+    source: str = "",
     sort: str = "not_after",
     limit: int = Query(100, le=1000),
     offset: int = 0,
@@ -351,6 +353,8 @@ def list_certificates(
         ))
     if issuer:
         stmt = stmt.where(func.lower(Certificate.issuer_cn).like(f"%{issuer.lower()}%"))
+    if source:
+        stmt = stmt.where(Certificate.source == source)
     if self_signed is not None:
         stmt = stmt.where(Certificate.self_signed.is_(self_signed))
     if internal is not None:
@@ -639,6 +643,66 @@ def evaluate_findings(
     audit(db, principal["email"], "finding.evaluate", "finding", "-", str(active))
     db.commit()
     return {"active": active}
+
+
+# --------------------------------------------------------------------------- #
+# Watched domains (Certificate Transparency monitoring, Phase 2.5 Task 9)
+# --------------------------------------------------------------------------- #
+@app.get("/api/watched-domains", dependencies=[Depends(require_role("viewer"))])
+def list_watched_domains(db: Session = Depends(get_db)):
+    rows = db.scalars(select(WatchedDomain).order_by(WatchedDomain.domain.asc())).all()
+    return {"items": [{
+        "id": w.id, "domain": w.domain, "enabled": w.enabled,
+        "last_checked_at": w.last_checked_at, "last_crtsh_id": w.last_crtsh_id,
+        "created_at": w.created_at,
+    } for w in rows]}
+
+
+@app.post("/api/watched-domains")
+def create_watched_domain(
+    body: dict,
+    principal: dict = Depends(require_role("admin")),
+    db: Session = Depends(get_db),
+):
+    domain = (body.get("domain") or "").strip().lower()
+    if not domain:
+        raise HTTPException(status_code=422, detail="domain is required")
+    w = WatchedDomain(domain=domain, enabled=bool(body.get("enabled", True)))
+    db.add(w)
+    db.flush()
+    audit(db, principal["email"], "watched_domain.create", "watched_domain", w.id, domain)
+    db.commit()
+    return {"id": w.id, "domain": w.domain, "enabled": w.enabled}
+
+
+@app.delete("/api/watched-domains/{domain_id}")
+def delete_watched_domain(
+    domain_id: int,
+    principal: dict = Depends(require_role("admin")),
+    db: Session = Depends(get_db),
+):
+    w = db.get(WatchedDomain, domain_id)
+    if w is None:
+        raise HTTPException(status_code=404, detail="not found")
+    audit(db, principal["email"], "watched_domain.delete", "watched_domain", domain_id, w.domain)
+    db.delete(w)
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/watched-domains/{domain_id}/check")
+def check_watched_domain(
+    domain_id: int,
+    principal: dict = Depends(require_role("operator")),
+    db: Session = Depends(get_db),
+):
+    w = db.get(WatchedDomain, domain_id)
+    if w is None:
+        raise HTTPException(status_code=404, detail="not found")
+    queue.enqueue(db, "ct_check", {"domain_id": w.id})
+    audit(db, principal["email"], "watched_domain.check", "watched_domain", w.id, w.domain)
+    db.commit()
+    return {"ok": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -1360,11 +1424,16 @@ def dashboard(db: Session = Depends(get_db)):
     total_certs = db.scalar(select(func.count(Certificate.id))) or 0
     total_endpoints = db.scalar(select(func.count(Endpoint.id))) or 0
 
+    # ponytail: dashboard operational tiles count network-observed certs only;
+    # CT-discovered shadow certs surface via the unknown_issuance finding, not
+    # these tiles, so they don't inflate expiry/health metrics.
     def count_window(days):
         return db.scalar(select(func.count(Certificate.id)).where(
+            Certificate.source == "network",
             Certificate.not_after >= now, Certificate.not_after <= now + timedelta(days=days))) or 0
 
-    expired = db.scalar(select(func.count(Certificate.id)).where(Certificate.not_after < now)) or 0
+    expired = db.scalar(select(func.count(Certificate.id)).where(
+        Certificate.source == "network", Certificate.not_after < now)) or 0
     failed = db.scalar(select(func.count(Endpoint.id)).where(
         Endpoint.last_status != "ok", Endpoint.last_status != "")) or 0
     changed = db.scalar(select(func.count(CertificateObservation.id)).where(

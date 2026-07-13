@@ -94,6 +94,15 @@ class Settings(BaseSettings):
     finding_max_lifetime_days: int = 398
     finding_deprecated_sig_substrings: str = "sha1,md5"
 
+    # --- Certificate Transparency monitoring (Phase 2.5) ---
+    # Base URL of the CT source (crt.sh-compatible JSON API). Blank disables
+    # CT monitoring entirely and makes ct_tick a no-op. Air-gapped sites can
+    # point this at an internal crt.sh mirror/proxy.
+    ct_source_url: str = "https://crt.sh"
+    ct_check_frequency_hours: int = 24
+    ct_finding_severity: str = "warning"
+    ct_max_entries_per_run: int = 200
+
     @model_validator(mode="after")
     def _fill_ephemeral_session_secret(self) -> "Settings":
         # ponytail: no CERTWATCH_SESSION_SECRET configured — generate a random

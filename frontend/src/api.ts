@@ -66,7 +66,11 @@ export interface Cert {
   not_after: string | null; self_signed: boolean; internal_issued: boolean; is_wildcard: boolean; is_ca: boolean;
   chain_length: number; first_seen: string; last_seen: string; days_until_expiry: number | null;
   expired: boolean; severity: string; expiry_phrase: string; endpoint_count: number;
-  pem?: string; endpoints?: Endpoint[]; observations?: Observation[];
+  source: "network" | "ct"; pem?: string; endpoints?: Endpoint[]; observations?: Observation[];
+}
+export interface WatchedDomain {
+  id: number; domain: string; enabled: boolean;
+  last_checked_at: string | null; last_crtsh_id: number | null; created_at: string;
 }
 export interface Endpoint {
   id: number; target_id: number | null; target_name: string; environment: string; owner: string;

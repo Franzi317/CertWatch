@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { api, Channel } from "../api";
-import { Modal, useToast } from "../ui";
+import { api, Channel, WatchedDomain } from "../api";
+import { Modal, fmtDate, useToast } from "../ui";
 
 type ChannelDraft = {
   id?: number; name: string; channel_type: string; enabled: boolean; re_alert_hours: number; config: any;
@@ -18,11 +18,15 @@ export default function Settings() {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [draft, setDraft] = useState<ChannelDraft | null>(null);
   const [sys, setSys] = useState<Record<string, any>>({});
+  const [domains, setDomains] = useState<WatchedDomain[]>([]);
+  const [newDomain, setNewDomain] = useState("");
+  const [checking, setChecking] = useState<number | null>(null);
   const { show, node } = useToast();
 
   const load = () => {
     api.get<Channel[]>("/channels").then(setChannels).catch(() => {});
     api.get<Record<string, any>>("/settings").then(setSys).catch(() => {});
+    api.get<{ items: WatchedDomain[] }>("/watched-domains").then((r) => setDomains(r.items)).catch(() => {});
   };
   useEffect(() => { load(); }, []);
 
@@ -44,6 +48,31 @@ export default function Settings() {
   }
   async function saveSys() {
     await api.put("/settings", sys); show("Settings saved."); load();
+  }
+  async function addDomain() {
+    const domain = newDomain.trim();
+    if (!domain) return;
+    try {
+      await api.post("/watched-domains", { domain });
+      setNewDomain(""); load(); show("Domain added.");
+    } catch (e: any) { show(e.message, true); }
+  }
+  async function removeDomain(d: WatchedDomain) {
+    if (!confirm(`Stop watching "${d.domain}"?`)) return;
+    try { await api.del(`/watched-domains/${d.id}`); load(); }
+    catch (e: any) { show(e.message, true); }
+  }
+  async function checkDomain(d: WatchedDomain) {
+    setChecking(d.id);
+    try {
+      await api.post(`/watched-domains/${d.id}/check`);
+      show(`Check queued for ${d.domain}.`);
+      load();
+    } catch (e: any) {
+      show("Check failed: " + e.message, true);
+    } finally {
+      setChecking(null);
+    }
   }
   function editChannel(c: Channel) {
     // Secrets are never returned; start blank and only send if changed.
@@ -94,6 +123,41 @@ export default function Settings() {
             <div className="field"><label><input type="checkbox" checked={!!sys.alert_on_self_signed} onChange={(e) => setSys({ ...sys, alert_on_self_signed: e.target.checked })} /> Alert on self-signed certificates</label></div>
           </div>
           <button onClick={saveSys}>Save settings</button>
+        </div>
+
+        <div className="panel">
+          <div className="row">
+            <h2 style={{ margin: 0 }}>Watched domains (CT monitoring)</h2>
+            <div className="spacer" />
+            <input
+              placeholder="example.com"
+              value={newDomain}
+              onChange={(e) => setNewDomain(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") addDomain(); }}
+              style={{ width: 220 }}
+            />
+            <button className="secondary" onClick={addDomain}>+ Add domain</button>
+          </div>
+          <table style={{ marginTop: 12 }}>
+            <thead><tr><th>Domain</th><th>Enabled</th><th>Last checked</th><th>Last crt.sh ID</th><th></th></tr></thead>
+            <tbody>
+              {domains.map((d) => (
+                <tr key={d.id}>
+                  <td>{d.domain}</td>
+                  <td>{d.enabled ? "yes" : "no"}</td>
+                  <td>{d.last_checked_at ? fmtDate(d.last_checked_at) : <span className="muted">never</span>}</td>
+                  <td className="mono">{d.last_crtsh_id ?? "—"}</td>
+                  <td><div className="row" style={{ gap: 4 }}>
+                    <button className="ghost" disabled={checking === d.id} onClick={() => checkDomain(d)}>
+                      {checking === d.id ? "Checking…" : "Check now"}
+                    </button>
+                    <button className="ghost" style={{ color: "var(--critical)" }} onClick={() => removeDomain(d)}>Delete</button>
+                  </div></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {domains.length === 0 && <div className="empty">No watched domains. Add one to discover certificates via Certificate Transparency logs.</div>}
         </div>
       </div>
 
