@@ -105,8 +105,10 @@ def _process_ct_check(db, item) -> None:
     """Run the `ct_check` queue step (Phase 2.5): poll the CT source for one
     WatchedDomain, ingest any cert whose fingerprint isn't already in inventory
     as source="ct", and run the findings engine so unknown_issuance fires.
-    Advances the domain's crt.sh high-water mark. Fail-closed: any error fails
-    the queue item (retry/backoff) and never crashes the worker."""
+    Advances the domain's crt.sh high-water mark after each entry (durable
+    progress). Fail-closed only at the `list_entries` network boundary -- a
+    per-entry `fetch_der`/`parse_certificate` error is logged and skipped so
+    one poison entry can't stall every newer entry behind it."""
     domain_id = item.payload.get("domain_id")
     domain = db.get(WatchedDomain, domain_id) if domain_id is not None else None
     if domain is None:
@@ -116,15 +118,26 @@ def _process_ct_check(db, item) -> None:
         # feature disabled after this item was enqueued -- nothing to do
         queue.complete(db, item)
         return
+
     try:
         entries = ct_source.list_entries(settings.ct_source_url, domain.domain)
-        watermark = domain.last_crtsh_id or 0
-        max_id = watermark
-        for entry in entries:
-            eid = entry.get("id")
-            if eid is None or eid <= watermark:
-                continue
-            max_id = max(max_id, eid)
+    except Exception as e:  # noqa: BLE001 - the list call is the network boundary; fail closed
+        log.exception("ct_check list_entries failed for domain %s (queue item %s)", domain_id, item.id)
+        db.rollback()
+        queue.fail(db, item, str(e))
+        return
+
+    watermark = domain.last_crtsh_id or 0
+    # Ascending by id so the per-entry watermark write is always monotonic; cap
+    # the batch so a large first sync can't outrun the queue lease or hammer crt.sh.
+    new_entries = sorted(
+        (e for e in entries if e.get("id") is not None and e["id"] > watermark),
+        key=lambda e: e["id"],
+    )[: settings.ct_max_entries_per_run]
+
+    for entry in new_entries:
+        eid = entry["id"]
+        try:
             der = ct_source.fetch_der(settings.ct_source_url, eid)
             fields = parse_certificate(der)
             existing = db.scalar(
@@ -134,19 +147,28 @@ def _process_ct_check(db, item) -> None:
             )
             cert = scan_engine._upsert_certificate(db, fields, source="ct")
             db.flush()
-            # Only run findings for a genuinely new CT cert (unbound). A
-            # fingerprint already in inventory is network-known -> no finding.
             if existing is None:
                 findings.evaluate_certificate(db, cert, endpoint=None)
-        domain.last_crtsh_id = max_id
+        except Exception as e:  # noqa: BLE001 - one bad entry must not stall the whole domain
+            # ponytail: a bad OR transiently-failing entry is skipped and the
+            # watermark still advances past it, so a single poison entry (malformed
+            # DER, precert, crt.sh HTML error) can't blackhole every newer entry.
+            # Trade-off: a transient fetch error skips that one cert permanently
+            # (it will not re-appear under the same id). Add a retry/dead-letter
+            # list only if that miss rate ever matters.
+            log.warning("ct_check: skipping entry id=%s for %s: %s", eid, domain.domain, e)
+            db.rollback()
+        # Advance and persist the watermark past this entry regardless of outcome.
+        domain.last_crtsh_id = eid
         domain.last_checked_at = utcnow()
         db.commit()
-    except Exception as e:  # noqa: BLE001 - any CT failure must not kill the worker
-        log.exception("ct_check failed for domain %s (queue item %s)", domain_id, item.id)
-        db.rollback()
-        queue.fail(db, item, str(e))
-    else:
-        queue.complete(db, item)
+
+    if not new_entries:
+        # nothing new, but record that the check ran
+        domain.last_checked_at = utcnow()
+        db.commit()
+
+    queue.complete(db, item)
 
 
 def _process_issuance(db, item) -> None:

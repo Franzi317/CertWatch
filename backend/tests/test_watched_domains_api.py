@@ -17,6 +17,25 @@ def test_crud_watched_domains(client, monkeypatch):
     assert all(d["id"] != did for d in client.get("/api/watched-domains").json()["items"])
 
 
+def test_create_watched_domain_writes_audit_log(client, monkeypatch):
+    from tests.conftest import login_as
+    from app.db import SessionLocal
+    from app.models import AuditLog
+
+    actor = login_as(client, "admin", monkeypatch)
+
+    r = client.post("/api/watched-domains", json={"domain": "audit.example.com"})
+    assert r.status_code == 200, r.text
+
+    s = SessionLocal()
+    try:
+        rows = s.query(AuditLog).filter_by(action="watched_domain.create").all()
+    finally:
+        s.close()
+    assert rows, "expected a watched_domain.create audit log row"
+    assert rows[0].actor == actor["email"]
+
+
 def test_watched_domains_require_admin(client, monkeypatch):
     from tests.conftest import login_as
     login_as(client, "operator", monkeypatch)

@@ -1,7 +1,7 @@
 import datetime
 
 from app import worker, ct_source
-from app.models import Certificate, Endpoint, Finding, Target, WatchedDomain, WorkQueue, utcnow
+from app.models import Certificate, Finding, WatchedDomain, WorkQueue
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -78,12 +78,62 @@ def test_ct_check_known_fingerprint_no_finding(db, monkeypatch):
     assert db.query(Certificate).count() == 1  # deduped by fingerprint
 
 
-def test_ct_check_fetch_error_fails_item(db, monkeypatch):
+def test_ct_check_fetch_error_skips_entry(db, monkeypatch):
     w = _watched(db)
     monkeypatch.setattr(ct_source, "list_entries", lambda base, dom, **k: [{"id": 300}])
     def boom(base, cid, **k):
         raise RuntimeError("crt.sh unreachable")
     monkeypatch.setattr(ct_source, "fetch_der", boom)
+    item = _enqueue_ct(db, w.id)
+    worker._process_ct_check(db, item)
+
+    assert db.query(Certificate).count() == 0
+    db.refresh(w)
+    assert w.last_crtsh_id == 300  # watermark advances past the bad entry
+    assert db.get(WorkQueue, item.id).status == "done"
+
+
+def test_ct_check_poison_entry_does_not_stall_batch(db, monkeypatch):
+    w = _watched(db)
+    monkeypatch.setattr(ct_source, "list_entries", lambda base, dom, **k: [{"id": 10}, {"id": 11}, {"id": 12}])
+
+    def fake_fetch_der(base, cid, **k):
+        if cid == 11:
+            raise RuntimeError("malformed DER")
+        return _der(f"poison-{cid}.example.com")
+
+    monkeypatch.setattr(ct_source, "fetch_der", fake_fetch_der)
+    item = _enqueue_ct(db, w.id)
+    worker._process_ct_check(db, item)
+
+    certs = db.query(Certificate).filter_by(source="ct").all()
+    assert len(certs) == 2
+    assert db.query(Finding).filter_by(rule_id="unknown_issuance", status="active").count() == 2
+    db.refresh(w)
+    assert w.last_crtsh_id == 12
+    assert db.get(WorkQueue, item.id).status == "done"
+
+
+def test_ct_check_caps_entries_per_run(db, monkeypatch):
+    w = _watched(db)
+    monkeypatch.setattr(worker.settings, "ct_max_entries_per_run", 2, raising=False)
+    monkeypatch.setattr(ct_source, "list_entries", lambda base, dom, **k: [{"id": 1}, {"id": 2}, {"id": 3}])
+    monkeypatch.setattr(ct_source, "fetch_der", lambda base, cid, **k: _der(f"cap-{cid}.example.com"))
+
+    item = _enqueue_ct(db, w.id)
+    worker._process_ct_check(db, item)
+
+    assert db.query(Certificate).filter_by(source="ct").count() == 2
+    db.refresh(w)
+    assert w.last_crtsh_id == 2  # next run continues from here
+    assert db.get(WorkQueue, item.id).status == "done"
+
+
+def test_ct_check_list_error_fails_item(db, monkeypatch):
+    w = _watched(db)
+    def boom(base, dom, **k):
+        raise RuntimeError("crt.sh unreachable")
+    monkeypatch.setattr(ct_source, "list_entries", boom)
     item = _enqueue_ct(db, w.id)
     worker._process_ct_check(db, item)
     q = db.get(WorkQueue, item.id)

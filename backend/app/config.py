@@ -101,6 +101,7 @@ class Settings(BaseSettings):
     ct_source_url: str = "https://crt.sh"
     ct_check_frequency_hours: int = 24
     ct_finding_severity: str = "warning"
+    ct_max_entries_per_run: int = 200
 
     @model_validator(mode="after")
     def _fill_ephemeral_session_secret(self) -> "Settings":
