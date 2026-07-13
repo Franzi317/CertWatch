@@ -456,6 +456,23 @@ class ReportSchedule(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class WatchedDomain(Base):
+    """A domain polled against a Certificate Transparency source (crt.sh) to
+    find publicly-issued certs CertWatch never observed on its own network.
+    Just the poll list -- discovered certs/findings are not FK'd to it.
+    Ticked by `scheduler.ct_tick`, executed by `worker._process_ct_check`."""
+
+    __tablename__ = "watched_domains"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    domain: Mapped[str] = mapped_column(String(255))  # e.g. example.com; queried as %.example.com
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # high-water mark: max crt.sh entry id already processed for this domain.
+    last_crtsh_id: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     __table_args__ = (Index("ix_audit_logs_created_at", "created_at"),)
