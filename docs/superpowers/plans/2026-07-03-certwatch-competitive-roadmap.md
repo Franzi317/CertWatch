@@ -57,7 +57,12 @@ explicitly out of scope and deleted from the research roadmap.
 
 ---
 
-## Phase 0 — Foundation (~6–8 weeks)
+> **Status (2026-07-12):** Phases 0, 1, and 2 are complete and merged to `main`
+> (see `phase0-foundation`, `phase1-lifecycle`, `phase2-enterprise` plans and the
+> merge commits). Phases 2.5 and 2.6 are new (added 2026-07-12) and are next in
+> line; Phases 3 and 4 follow.
+
+## Phase 0 — Foundation (~6–8 weeks) — ✅ COMPLETE
 
 Everything later depends on this. No product-visible features except login.
 
@@ -133,7 +138,7 @@ all existing tests pass plus new auth/queue tests.
 
 ---
 
-## Phase 1 — Lifecycle MVP (~10–12 weeks)
+## Phase 1 — Lifecycle MVP (~10–12 weeks) — ✅ COMPLETE
 
 Turns "visibility + alerting" into "visibility + renewal + deployment." This is
 the phase that makes CertWatch a Command competitor rather than a scanner.
@@ -213,7 +218,10 @@ against a lab CA. All order transitions audited.
 
 ---
 
-## Phase 2 — Enterprise Controls (~6–8 weeks)
+## Phase 2 — Enterprise Controls (~6–8 weeks) — ✅ COMPLETE (except 2.2)
+
+> 2.2 (outbound webhook events) did not ship with the phase2-enterprise merge;
+> it is carried forward into Phase 2.6 item 3 below.
 
 Makes it pass an internal security review and an ops handoff.
 
@@ -258,10 +266,119 @@ audit, secrets, backup) fully green.
 
 ---
 
+## Phase 2.5 — Visibility Deepening (~3–4 weeks) — NEW (added 2026-07-12)
+
+Highest-leverage additions per post-Phase-2 gap review: network scanning only
+inventories what is reachable and speaking implicit TLS. These three close the
+biggest blind spots at small cost, with no new deployables.
+
+### 2.5.1 Certificate Transparency (CT) log monitoring
+- Turns "inventory of what we scanned" into "inventory of what exists": finds
+  publicly-issued certs for the org's domains that never touched a scanned
+  endpoint — shadow IT, rogue/unsanctioned CA issuance, forgotten SaaS certs.
+- New entity `WatchedDomain` (domain, enabled, last_checked_at). Scheduler tick
+  enqueues `kind=ct_check` jobs; worker polls crt.sh (or a CT log API) per
+  domain, diffs SHA-256 fingerprints against the existing `Certificate` table.
+- Unknown cert → ingest with `source=ct` discriminator (pre-figures the Phase 4
+  `source` column) + raise a `Finding` (`unknown_issuance`, severity by
+  environment match). Reuses findings disposition flow unchanged.
+- UI: Watched Domains settings section; CT-discovered certs badge in inventory.
+- ponytail: crt.sh HTTP JSON only — no RFC 6962 log tailing, no Merkle proofs.
+  Upgrade to direct log tailing only if crt.sh rate limits become a real problem.
+
+### 2.5.2 STARTTLS support in the scanner
+- `scanner.py` only does implicit TLS, yet the target UI offers port 587;
+  SMTP (25/587), IMAP (143), POP3 (110), and LDAP (389) currently report
+  `non_tls_service`. Mail and directory infra is exactly where forgotten certs live.
+- Add a pre-handshake negotiation step keyed by port/protocol (explicit
+  `starttls` field on the target port config, default inferred from well-known
+  ports): tiny stdlib exchanges (`EHLO`+`STARTTLS`, IMAP `STARTTLS`, POP3 `STLS`,
+  LDAP extended op) then the existing `wrap_socket` path. No new dependencies.
+- New scan status `starttls_failed` distinct from `tls_handshake_failed`.
+
+### 2.5.3 CA hierarchy / chain expiry view
+- Chains are already captured (Python 3.13 `get_unverified_chain`) but there is
+  no roll-up: which intermediates/roots does the estate depend on, and when do
+  *they* expire? One expiring intermediate is a thousand-cert incident.
+- Group leaf certs by issuing chain fingerprints; "CA view" page showing each
+  intermediate/root, its expiry, and dependent-leaf counts. Alert rule
+  `issuer_expiring` when an intermediate/root enters a threshold band (reuses
+  AlertEvent machinery unchanged).
+- Mostly queries over data already stored — no scanner changes.
+
+**Phase 2.5 exit criteria:** a cert issued for a watched domain but never
+scanned appears in inventory with a finding within one CT tick; port 587
+STARTTLS capture works against a real mail server; CA view lists every
+intermediate in the estate with dependent counts and alerts on expiry.
+
+---
+
+## Phase 2.6 — Enterprise Integration (~4–5 weeks) — NEW (added 2026-07-12)
+
+Email and Teams cards don't drive enterprise workflows — tickets, pages, and
+SIEM events do. Also removes the single-shared-token blast radius before
+third-party systems start calling the API.
+
+### 2.6.1 ITSM + on-call notification channels
+- New `NotificationChannel` kinds (existing abstraction, no schema change beyond
+  `kind`): **ServiceNow** and **Jira** (create ticket per alert, assignment from
+  the target's existing owner/team field, auto-close on alert auto-resolve),
+  **PagerDuty/Opsgenie** (Events API, critical severity only by default), and a
+  **Slack** format variant on the existing webhook sender (~90% shared code).
+- Ticket/incident id stored on `AlertEvent` for close-the-loop and dedupe.
+- ponytail: REST-only integrations with API-token auth — no ServiceNow MID
+  server, no Jira app/webhook registration. Per-channel field mapping is a
+  fixed JSON template, not a mapping UI.
+
+### 2.6.2 Scoped API tokens
+- `CERTWATCH_API_KEY` is one shared secret with operator rights — a single
+  blast radius the moment CI/CD or a CMDB sync integrates. New `ApiToken`
+  entity: name, hashed token (bcrypt, shown once at creation), role
+  (viewer/operator/admin), expires_at, disabled, last_used_at, created_by.
+- `require_role` accepts session **or** token; token actor recorded in
+  `AuditLog`. Static `CERTWATCH_API_KEY` kept as deprecated fallback for one
+  release, then removed.
+- Admin UI: token list, create (one-time reveal), revoke.
+
+### 2.6.3 Outbound events + SIEM export (absorbs original 2.2)
+- Ship the deferred 2.2 as specced: `Event` table (ring-buffer, 90-day
+  retention job), emit on cert discovered/changed/renewed, order state changes,
+  finding raised, alert raised/resolved; HMAC-signed generic-webhook delivery;
+  `GET /api/events` for pollers.
+- Plus SIEM leg: optional syslog (RFC 5424, TCP/TLS) forwarder for `AuditLog`
+  and `Event` rows — SOC ingestion without giving the SIEM API access.
+  ponytail: syslog + JSON payload only; no CEF/LEEF field mapping until a
+  specific SIEM demands it.
+
+**Phase 2.6 exit criteria:** an expiring-cert alert opens a ServiceNow or Jira
+ticket assigned to the cert's owner team and closes it on renewal; a critical
+alert pages via PagerDuty; a CI pipeline authenticates with a scoped
+viewer token and its calls appear in the audit log; webhook events verify
+against their HMAC signature; audit events arrive over syslog.
+
+---
+
 ## Phase 3 — Remote Agent + Store Connectors (~8–10 weeks)
 
 Only phase that adds a new deployable. Do not start until Phase 1 connectors
 have real usage — actual store demand should pick the connector order.
+
+### 3.0 Lifecycle coverage gaps (added 2026-07-12 — do these first, no agent needed)
+- **ACME DNS-01 adapter** — specced in 1.1 but the shipped adapter is HTTP-01
+  only. DNS-01 unlocks wildcards and non-HTTP services. Provider hook for
+  Azure DNS first (Entra shop), interface allows Route53/Cloudflare later.
+  Fits the existing `IssuerAdapter` protocol; credentials via `secrets.py`.
+- **Generic webhook/script deployment connector** — new `DeploymentTarget`
+  kinds `webhook` (POST cert/chain/key bundle to a URL, HMAC-signed) and
+  `command` (run a configured script with bundle paths as args). Lets the org
+  self-serve the long tail (HAProxy, nginx, appliances) instead of waiting for
+  bespoke connectors. Post-deploy verification applies unchanged.
+- **Pre-issuance policy checks** — the findings engine judges certs after they
+  exist; run the same rule set (allowed issuer per environment, min key
+  size/alg, max validity, wildcard/SAN naming restrictions) against the
+  order + CSR at `LifecycleOrder` creation. Violation → block, or force
+  `pending_approval` with the violation attached for the approver. Reuses
+  findings rules; no new engine.
 
 ### 3.1 Remote orchestrator agent
 - Python agent (same language as codebase — a Go rewrite is justified only if
@@ -302,7 +419,19 @@ Priority order for an Entra shop:
    TLS 1.0/1.1, weak suites.
 3. **Repo scanning** — scheduled scan of configured Git repos (Azure DevOps/
    GitHub) for private keys, PKCS#12/JKS files, PEM blocks → findings.
-4. PKCS#11/HSM inventory — only if the org actually owns HSMs.
+4. **CBOM / PQC-readiness report** (added 2026-07-12) — CycloneDX CBOM export
+   of the certificate estate (algorithms, key sizes, signature hashes) plus a
+   scheduled post-quantum-readiness posture report built on the existing
+   `ReportSchedule` machinery. Natural tie-in with CipherGap's quantum-grading
+   DNA and currently a differentiator vs Command. Narrow exception to the
+   dropped "compliance framework mapping" item: this is one export format, not
+   a framework engine.
+5. PKCS#11/HSM inventory — only if the org actually owns HSMs.
+6. **Team-scoped RBAC** (added 2026-07-12, pull-based) — per the 0.2 note,
+   scoped permission bindings only when a real requirement appears: scope
+   target/cert visibility and operator/approval rights by the owner/team tag
+   already on targets; admin stays global. This is team scoping within one org,
+   not multi-tenancy — the no-tenant constraint stands.
 
 ---
 
@@ -322,17 +451,19 @@ Priority order for an Entra shop:
 
 ## Sequencing & Effort Summary
 
-| Phase | Duration | Depends on | Headline |
-|---|---|---|---|
-| 0 Foundation | 6–8 wk | — | Migrations, Entra SSO, RBAC, audit, secrets, worker queue, metrics |
-| 1 Lifecycle MVP | 10–12 wk | 0 | ACME + AD CS issuance, renewal orders, PEM/PFX/JKS/IIS deploy, verify loop |
-| 2 Enterprise controls | 6–8 wk | 0 (parallel w/ late 1) | Reports, webhooks, backup/DR, findings |
-| 3 Agent + connectors | 8–10 wk | 1 | Remote agent, demand-driven store connectors |
-| 4 Crypto inventory | 8+ wk | 2 | Key Vault, cipher analytics, repo scan |
+| Phase | Duration | Depends on | Status | Headline |
+|---|---|---|---|---|
+| 0 Foundation | 6–8 wk | — | ✅ done | Migrations, Entra SSO, RBAC, audit, secrets, worker queue, metrics |
+| 1 Lifecycle MVP | 10–12 wk | 0 | ✅ done | ACME + AD CS issuance, renewal orders, PEM/PFX/JKS/IIS deploy, verify loop |
+| 2 Enterprise controls | 6–8 wk | 0 (parallel w/ late 1) | ✅ done (2.2 → 2.6.3) | Reports, backup/DR, findings |
+| 2.5 Visibility deepening | 3–4 wk | 2 | next | CT log monitoring, STARTTLS scanning, CA hierarchy view |
+| 2.6 Enterprise integration | 4–5 wk | 2 (parallel w/ 2.5) | planned | ITSM/PagerDuty/Slack channels, scoped API tokens, events + SIEM export |
+| 3 Agent + connectors | 8–10 wk | 1 | planned | 3.0 DNS-01 + webhook connector + pre-issuance policy, then remote agent, store connectors |
+| 4 Crypto inventory | 8+ wk | 2 | pull-based | Key Vault, cipher analytics, repo scan, CBOM/PQC report, team RBAC |
 
-Roughly 9–12 months with 2–3 engineers to end of Phase 3 — the point at which
-CertWatch covers the Command capabilities a single org actually exercises
-(discover → renew → deploy → verify → govern). Phase 4 is pull-based.
+Phases 2.5 and 2.6 are deliberately small and independent of the agent work —
+they are the highest visibility-and-integration return per week and can run in
+parallel with each other. Phase 4 remains pull-based.
 
 ## Execution Protocol
 
