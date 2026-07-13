@@ -188,15 +188,15 @@ def _get_or_create_endpoint(db, target, host, ip, port) -> Endpoint:
     return ep
 
 
-def _upsert_certificate(db, fields: dict) -> Certificate:
+def _upsert_certificate(db, fields: dict, source: str = "network") -> Certificate:
     fp = fields["fingerprint_sha256"]
     cert = db.scalar(select(Certificate).where(Certificate.fingerprint_sha256 == fp))
     if cert is None:
-        cert = Certificate(**fields)
+        cert = Certificate(**fields, source=source)
         db.add(cert)
         db.flush()
     else:
-        cert.last_seen = utcnow()  # preserve first_seen; only bump last_seen
+        cert.last_seen = utcnow()  # preserve first_seen and source; only bump last_seen
     return cert
 
 
