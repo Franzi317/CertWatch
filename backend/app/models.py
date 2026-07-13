@@ -132,6 +132,11 @@ class Certificate(Base):
     is_wildcard: Mapped[bool] = mapped_column(Boolean, default=False)
     is_ca: Mapped[bool] = mapped_column(Boolean, default=False)
     chain_length: Mapped[int] = mapped_column(Integer, default=1)
+    # network = observed on our network via a scan; ct = discovered in a
+    # Certificate Transparency log for a WatchedDomain. ponytail: provenance of
+    # first discovery only -- NOT flipped when a ct cert is later scanned; the
+    # unknown_issuance finding clears off endpoint binding instead (findings.py).
+    source: Mapped[str] = mapped_column(String(16), default="network")
     pem: Mapped[str] = mapped_column(Text, default="")
     first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
