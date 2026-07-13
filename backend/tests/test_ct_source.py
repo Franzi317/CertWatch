@@ -1,5 +1,4 @@
 import httpx
-import pytest
 
 from app import ct_source
 from cryptography import x509
@@ -49,4 +48,16 @@ def test_fetch_der_returns_bytes():
                               headers={"content-type": "application/pkix-cert"})
     out = ct_source.fetch_der("https://crt.sh", 42, client=_client(handler))
     # round-trips through cryptography -> same cert
+    assert x509.load_der_x509_certificate(out).subject == x509.load_der_x509_certificate(der).subject
+
+
+def test_fetch_der_converts_pem_to_der():
+    der = _self_signed_der()
+    pem = x509.load_der_x509_certificate(der).public_bytes(serialization.Encoding.PEM)
+    def handler(req):
+        assert "d=42" in str(req.url)
+        return httpx.Response(200, content=pem,
+                              headers={"content-type": "text/plain"})
+    out = ct_source.fetch_der("https://crt.sh", 42, client=_client(handler))
+    # PEM response is converted to DER, still the same cert
     assert x509.load_der_x509_certificate(out).subject == x509.load_der_x509_certificate(der).subject
