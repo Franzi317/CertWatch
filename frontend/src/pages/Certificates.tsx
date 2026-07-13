@@ -11,6 +11,7 @@ const VIEWS: Record<string, string> = {
   internal: "internal=true",
   external: "internal=false",
   selfsigned: "self_signed=true",
+  ct: "source=ct",
 };
 
 export default function Certificates() {
@@ -32,7 +33,7 @@ export default function Certificates() {
           <div className="row" style={{ marginBottom: 14 }}>
             {Object.keys(VIEWS).map((v) => (
               <button key={v} className={view === v ? "" : "secondary"} onClick={() => setView(v)}>
-                {{ all: "All", expiring90: "Expiring ≤90d", expiring30: "Expiring ≤30d", expired: "Expired", internal: "Internal", external: "External", selfsigned: "Self-signed" }[v]}
+                {{ all: "All", expiring90: "Expiring ≤90d", expiring30: "Expiring ≤30d", expired: "Expired", internal: "Internal", external: "External", selfsigned: "Self-signed", ct: "CT-discovered" }[v]}
               </button>
             ))}
             <div className="spacer" />
@@ -47,7 +48,7 @@ export default function Certificates() {
               { key: "severity", header: "Status", value: (c) => c.days_until_expiry ?? 99999, render: (c) => <SeverityBadge severity={c.severity} label={c.expiry_phrase} /> },
               { key: "not_after", header: "Expires", value: (c) => c.not_after || "", render: (c) => fmtDate(c.not_after) },
               { key: "public_key_algorithm", header: "Key", render: (c) => `${c.public_key_algorithm}${c.public_key_size ? " " + c.public_key_size : ""}` },
-              { key: "flags", header: "Flags", render: (c) => <>{c.internal_issued && <span className="tag">internal</span>}{c.self_signed && <span className="tag">self-signed</span>}{c.is_wildcard && <span className="tag">wildcard</span>}{c.is_ca && <span className="tag">CA</span>}</> },
+              { key: "flags", header: "Flags", render: (c) => <>{c.source === "ct" && <span className="tag">CT</span>}{c.internal_issued && <span className="tag">internal</span>}{c.self_signed && <span className="tag">self-signed</span>}{c.is_wildcard && <span className="tag">wildcard</span>}{c.is_ca && <span className="tag">CA</span>}</> },
               { key: "endpoint_count", header: "Endpoints" },
             ]}
             empty="No certificates match this view."
