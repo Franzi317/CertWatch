@@ -66,8 +66,16 @@ export interface Cert {
   not_after: string | null; self_signed: boolean; internal_issued: boolean; is_wildcard: boolean; is_ca: boolean;
   chain_length: number; first_seen: string; last_seen: string; days_until_expiry: number | null;
   expired: boolean; severity: string; expiry_phrase: string; endpoint_count: number;
-  source: "network" | "ct"; pem?: string; endpoints?: Endpoint[]; observations?: Observation[];
+  source: "network" | "ct" | "chain"; pem?: string; endpoints?: Endpoint[]; observations?: Observation[];
 }
+export interface CaCertificate extends Cert {
+  dependent_count: number;
+  is_root: boolean;
+}
+// Other pages call `api.get<T>(path)` inline rather than through named helpers;
+// this one is exported as a helper per the CA-hierarchy task spec, but follows
+// the same api.get<T> convention (path is relative to the /api BASE).
+export const listCaCertificates = () => api.get<{ items: CaCertificate[] }>("/ca-certificates");
 export interface WatchedDomain {
   id: number; domain: string; enabled: boolean;
   last_checked_at: string | null; last_crtsh_id: number | null; created_at: string;
@@ -100,7 +108,8 @@ export interface Issuer {
   config: Record<string, any>;
 }
 export interface Dashboard {
-  total_certificates: number; total_endpoints: number; expiring_90d: number; expiring_30d: number;
+  total_certificates: number; total_endpoints: number; expiring_90d: number; ca_expiring_90d: number;
+  expiring_30d: number;
   expiring_7d: number; expired: number; failed_scans: number; recently_changed: number;
   open_alerts: number; last_successful_scan: string | null; next_scheduled_scan: string | null;
   managed_certificates: number; unmanaged_certificates: number; orders_in_flight: number;

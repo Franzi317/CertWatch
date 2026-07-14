@@ -257,7 +257,10 @@ def evaluate_all(db: Session) -> int:
         evaluate_certificate(db, cert, endpoint=ep)
         referenced_cert_ids.add(cert.id)
 
-    all_certs = db.scalars(select(Certificate)).all()
+    # ponytail: CA certs (source="chain") are not endpoint-served leaves; a 10-20yr
+    # intermediate would trip long_lifetime and its expiry is covered by the
+    # issuer_expiring alert. Crypto-risk findings on CA certs deferred.
+    all_certs = db.scalars(select(Certificate).where(Certificate.source != "chain")).all()
     for cert in all_certs:
         if cert.id not in referenced_cert_ids:
             evaluate_certificate(db, cert, endpoint=None)

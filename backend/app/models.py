@@ -137,6 +137,11 @@ class Certificate(Base):
     # first discovery only -- NOT flipped when a ct cert is later scanned; the
     # unknown_issuance finding clears off endpoint binding instead (findings.py).
     source: Mapped[str] = mapped_column(String(16), default="network")
+    # For a leaf: SHA-256 fingerprints of its non-leaf chain members (issuing
+    # CAs), populated by ca_hierarchy.derive. NULL = not yet derived (the
+    # incremental sentinel); [] = derived with no CA members; CA rows
+    # (source="chain") stay NULL (never treated as leaves).
+    chain_ca_fingerprints: Mapped[list | None] = mapped_column(JSON, nullable=True, default=None)
     pem: Mapped[str] = mapped_column(Text, default="")
     first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

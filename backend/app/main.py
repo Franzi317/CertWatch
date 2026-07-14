@@ -65,6 +65,7 @@ DEFAULT_SETTINGS = {
     "alert_on_self_signed": False,
     "app_base_url": "http://localhost:5173",
     "default_ports": [443, 8443, 9443, 636, 993, 995, 465, 587, 3389, 5986],
+    "ca_alert_thresholds": "180,90,30",
 }
 
 # CSV column sets for ?format=csv on the list endpoints (Phase 2, Task 1).
@@ -380,6 +381,22 @@ def list_certificates(
         return Response(content=csv_text, media_type="text/csv",
                          headers={"Content-Disposition": 'attachment; filename="certificates.csv"'})
     return {"total": total, "items": items}
+
+
+@app.get("/api/ca-certificates", dependencies=[Depends(require_role("viewer"))])
+def list_ca_certificates(db: Session = Depends(get_db)):
+    from . import ca_hierarchy
+    counts = ca_hierarchy.dependent_counts(db)
+    rows = db.scalars(
+        select(Certificate).where(Certificate.source == "chain").order_by(Certificate.not_after.asc())
+    ).all()
+    items = []
+    for c in rows:
+        d = cert_dict(db, c)
+        d["dependent_count"] = counts.get(c.fingerprint_sha256, 0)
+        d["is_root"] = bool(c.self_signed and c.is_ca)
+        items.append(d)
+    return {"items": items}
 
 
 @app.get("/api/certificates/{cert_id}", dependencies=[Depends(require_role("viewer"))])
@@ -1434,6 +1451,18 @@ def dashboard(db: Session = Depends(get_db)):
 
     expired = db.scalar(select(func.count(Certificate.id)).where(
         Certificate.source == "network", Certificate.not_after < now)) or 0
+
+    # CA certs (source="chain") expiring within 90d that at least one leaf depends on.
+    from . import ca_hierarchy
+    ca_counts = ca_hierarchy.dependent_counts(db)
+    ca_expiring_90d = 0
+    for ca in db.scalars(select(Certificate).where(
+        Certificate.source == "chain",
+        Certificate.not_after >= now, Certificate.not_after <= now + timedelta(days=90),
+    )).all():
+        if ca_counts.get(ca.fingerprint_sha256, 0) >= 1:
+            ca_expiring_90d += 1
+
     failed = db.scalar(select(func.count(Endpoint.id)).where(
         Endpoint.last_status != "ok", Endpoint.last_status != "")) or 0
     changed = db.scalar(select(func.count(CertificateObservation.id)).where(
@@ -1502,6 +1531,7 @@ def dashboard(db: Session = Depends(get_db)):
         "total_certificates": total_certs,
         "total_endpoints": total_endpoints,
         "expiring_90d": count_window(90),
+        "ca_expiring_90d": ca_expiring_90d,
         "expiring_30d": count_window(30),
         "expiring_7d": count_window(7),
         "expired": expired,
