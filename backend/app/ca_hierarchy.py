@@ -27,6 +27,7 @@ from sqlalchemy import func, select
 from . import scan_engine
 from .models import Certificate
 from .scanner import parse_certificate
+from .status import days_until, expiry_phrase, severity
 
 log = logging.getLogger("certwatch.ca_hierarchy")
 
@@ -76,3 +77,30 @@ def dependent_counts(db) -> dict[str, int]:
         for fp in (fps or []):
             counter[fp] += 1
     return dict(counter)
+
+
+def expiring_ca_alerts(db, thresholds: list[int], now) -> dict[str, dict]:
+    """Desired issuer_expiring alerts: for each source="chain" CA with >=1
+    dependent leaf whose not_after falls within a threshold band (or is already
+    expired -> band 0). Returned dicts are merged into evaluate_alerts' desired
+    set, so they reconcile/auto-resolve like any other rule."""
+    counts = dependent_counts(db)
+    desired: dict[str, dict] = {}
+    cas = db.scalars(select(Certificate).where(Certificate.source == "chain")).all()
+    for ca in cas:
+        dep = counts.get(ca.fingerprint_sha256, 0)
+        if dep < 1:
+            continue
+        days = days_until(ca.not_after, now)
+        if days is None:
+            continue
+        th = 0 if days < 0 else next((t for t in sorted(thresholds) if days <= t), None)
+        if th is None:
+            continue
+        name = ca.common_name or ca.issuer_cn or ca.fingerprint_sha256
+        desired[f"issuer_expiring:{ca.id}:{th}"] = {
+            "endpoint_id": None, "certificate_id": ca.id, "rule_type": "issuer_expiring",
+            "threshold_days": th, "severity": severity(days),
+            "message": f"Issuing CA {name} {expiry_phrase(days)} — {dep} dependent certificate(s) (threshold {th}d)",
+        }
+    return desired

@@ -93,6 +93,13 @@ def evaluate_alerts(db: Session, now: datetime | None = None, dispatch: bool = T
                 "message": f"Self-signed certificate observed: {cert.common_name or cert.fingerprint_sha256}",
             }
 
+    # CA-hierarchy issuer_expiring alerts (Phase 2.5.3). Lazy import avoids a
+    # module-load cycle (ca_hierarchy -> scan_engine). Merged into `desired` so
+    # they reconcile/auto-resolve through the same loop below.
+    from . import ca_hierarchy
+    ca_thresholds = [int(x) for x in str(get_setting(db, "ca_alert_thresholds", "180,90,30")).split(",") if x.strip()]
+    desired.update(ca_hierarchy.expiring_ca_alerts(db, ca_thresholds, now))
+
     existing = {e.dedupe_key: e for e in db.scalars(select(AlertEvent)).all()}
 
     created = 0
@@ -233,6 +240,7 @@ def _format(db: Session, ev: AlertEvent):
         "renewal_failed": "Certificate renewal failed. Check the issuer connection and the lifecycle order error, then retry.",
         "deploy_failed": "Certificate deployment/verification failed. Check the deployment target and re-run the order.",
         "order_stuck": "A lifecycle order has been stuck in a non-terminal state. Investigate the worker and the order's transition log.",
+        "issuer_expiring": "An issuing CA (intermediate/root) is approaching expiry; plan its renewal — every dependent certificate must be re-issued from the new CA before it expires.",
     }.get(ev.rule_type, "Review the certificate.")
 
     facts = {
