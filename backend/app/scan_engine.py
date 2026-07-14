@@ -117,6 +117,15 @@ def _execute(db: Session, job: ScanJob, target: Target) -> None:
         _finish(db, job, "completed",
                 f"scanned {job.scanned_endpoints} endpoints, {job.certs_found} certs, {job.errors} errors")
 
+    # Extract CA hierarchy (source="chain" certs + leaf linkage) before alert
+    # evaluation, so the issuer_expiring rule can see the CA certs. Non-fatal:
+    # a derivation bug must never fail a scan (mirrors findings below).
+    from . import ca_hierarchy
+    try:
+        ca_hierarchy.derive(db)
+    except Exception:
+        log.exception("CA hierarchy derivation failed for job %s", job.id)
+
     # Evaluate alert rules after the job completes (import here to avoid cycle).
     from .alerts import evaluate_alerts
     try:
