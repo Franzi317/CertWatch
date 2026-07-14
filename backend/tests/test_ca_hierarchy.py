@@ -67,14 +67,25 @@ def test_derive_chainless_leaf_sets_empty_list(db):
 
 
 def test_derive_dedups_shared_intermediate(db):
-    # two leaves under the same intermediate -> one chain row
-    l1, fp1 = _leaf_with_chain(db, leaf_cn="a.example.com")
-    # reuse the same intermediate identity by building a second leaf that carries
-    # an intermediate with the SAME key/subject is non-trivial; instead assert the
-    # dedup path via re-deriving the same leaf twice yields no duplicate.
+    # ONE intermediate shared by TWO distinct leaves -> a single chain row,
+    # with a dependent-count of 2. This is the real cross-leaf dedup + rollup.
+    root_key, int_key = _key(), _key()
+    intermediate = _cert("Shared Intermediate CA", "Root CA", root_key, int_key, is_ca=True)
+    int_der = intermediate.public_bytes(serialization.Encoding.DER)
+    int_fp = parse_certificate(int_der)["fingerprint_sha256"]
+
+    for cn in ("a.example.com", "b.example.com"):
+        leaf_key = _key()
+        leaf = _cert(cn, "Shared Intermediate CA", int_key, leaf_key, is_ca=False, days=90)
+        leaf_der = leaf.public_bytes(serialization.Encoding.DER)
+        # both leaves carry the SAME intermediate DER -> identical fingerprint
+        fields = parse_certificate(leaf_der, [int_der])
+        db.add(Certificate(**fields, source="network"))
+    db.commit()
+
     ca_hierarchy.derive(db)
-    ca_hierarchy.derive(db)  # idempotent
-    assert db.query(Certificate).filter_by(source="chain").count() == 1
+    assert db.query(Certificate).filter_by(source="chain").count() == 1  # deduped
+    assert ca_hierarchy.dependent_counts(db)[int_fp] == 2  # both leaves depend on it
 
 
 def test_derive_is_incremental_skips_already_derived(db):
@@ -86,6 +97,33 @@ def test_derive_is_incremental_skips_already_derived(db):
     before = db.query(Certificate).filter_by(source="chain").count()
     ca_hierarchy.derive(db)
     assert db.query(Certificate).filter_by(source="chain").count() == before
+
+
+def test_derive_skips_malformed_chain_member(db):
+    # pem = valid leaf + valid intermediate + a garbage block that matches the
+    # cert regex but fails to parse. Derivation must skip only the bad member:
+    # extract the good intermediate, never crash, and leave no fingerprint for
+    # the garbage.
+    root_key, int_key, leaf_key = _key(), _key(), _key()
+    intermediate = _cert("Intermediate CA", "Root CA", root_key, int_key, is_ca=True)
+    leaf = _cert("leaf.example.com", "Intermediate CA", int_key, leaf_key, is_ca=False, days=90)
+    leaf_der = leaf.public_bytes(serialization.Encoding.DER)
+    int_der = intermediate.public_bytes(serialization.Encoding.DER)
+    int_fp = parse_certificate(int_der)["fingerprint_sha256"]
+
+    fields = parse_certificate(leaf_der, [int_der])  # pem = leaf + intermediate
+    garbage = "-----BEGIN CERTIFICATE-----\nnotvalidbase64==\n-----END CERTIFICATE-----\n"
+    fields["pem"] = fields["pem"] + garbage  # pem = leaf + intermediate + garbage
+    c = Certificate(**fields, source="network")
+    db.add(c)
+    db.commit()
+
+    ca_hierarchy.derive(db)  # must not raise
+    cas = db.query(Certificate).filter_by(source="chain").all()
+    assert len(cas) == 1  # only the valid intermediate; garbage skipped
+    assert cas[0].fingerprint_sha256 == int_fp
+    db.refresh(c)
+    assert c.chain_ca_fingerprints == [int_fp]  # garbage produced no fingerprint
 
 
 def test_dependent_counts_rollup(db):
