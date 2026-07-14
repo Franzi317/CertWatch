@@ -1,7 +1,7 @@
 import datetime
 
 from app.db import SessionLocal
-from app.models import Certificate, utcnow
+from app.models import Certificate, Endpoint, Target, utcnow
 
 
 def _seed(db):
@@ -23,12 +23,26 @@ def _seed(db):
                          source="chain", is_ca=True, self_signed=False, not_after=far)
     db.add_all([ca_soon, ca_orphan, ca_root, ca_far])
     # two leaves depend on CA:SOON; one on CA:ROOT; none on CA:SOON_ORPHAN or CA:FAR
-    db.add(Certificate(fingerprint_sha256="L1", common_name="l1", source="network",
-                       chain_ca_fingerprints=["CA:SOON"]))
-    db.add(Certificate(fingerprint_sha256="L2", common_name="l2", source="network",
-                       chain_ca_fingerprints=["CA:SOON"]))
-    db.add(Certificate(fingerprint_sha256="L3", common_name="l3", source="network",
-                       chain_ca_fingerprints=["CA:ROOT"]))
+    l1 = Certificate(fingerprint_sha256="L1", common_name="l1", source="network",
+                     chain_ca_fingerprints=["CA:SOON"])
+    l2 = Certificate(fingerprint_sha256="L2", common_name="l2", source="network",
+                     chain_ca_fingerprints=["CA:SOON"])
+    l3 = Certificate(fingerprint_sha256="L3", common_name="l3", source="network",
+                     chain_ca_fingerprints=["CA:ROOT"])
+    db.add_all([l1, l2, l3])
+    db.flush()
+    # bind the dependent leaves to endpoints so they count as LIVE dependents
+    # (dependent_counts is live-scoped)
+    t = Target(name="grp", target_type="hostname", value="host.example.com",
+               ports=[443], environment="prod")
+    db.add(t)
+    db.flush()
+    db.add(Endpoint(target_id=t.id, host="l1.example.com", ip="10.0.0.1", port=443,
+                    current_cert_id=l1.id, last_status="ok"))
+    db.add(Endpoint(target_id=t.id, host="l2.example.com", ip="10.0.0.2", port=443,
+                    current_cert_id=l2.id, last_status="ok"))
+    db.add(Endpoint(target_id=t.id, host="l3.example.com", ip="10.0.0.3", port=443,
+                    current_cert_id=l3.id, last_status="ok"))
     db.commit()
 
 

@@ -25,7 +25,7 @@ from cryptography.hazmat.primitives import serialization
 from sqlalchemy import func, select
 
 from . import scan_engine
-from .models import Certificate
+from .models import Certificate, Endpoint
 from .scanner import parse_certificate
 from .status import days_until, expiry_phrase, severity
 
@@ -65,12 +65,18 @@ def derive(db) -> int:
 
 
 def dependent_counts(db) -> dict[str, int]:
-    """fingerprint -> number of leaves whose chain includes that CA."""
+    """fingerprint -> number of LIVE leaves (currently served by some endpoint,
+    i.e. an endpoint's current_cert_id) whose chain includes that CA. Live-scoped
+    so a renewed CA's dependents drop to 0 -- old rotated-away leaf rows persist in
+    inventory but no longer count, which is what lets issuer_expiring auto-resolve
+    on renewal and keeps the dependent count reflecting the live estate."""
+    live = select(Endpoint.current_cert_id).where(Endpoint.current_cert_id.isnot(None))
     counter: Counter = Counter()
     rows = db.scalars(
         select(Certificate.chain_ca_fingerprints).where(
             Certificate.source != "chain",
             Certificate.chain_ca_fingerprints.isnot(None),
+            Certificate.id.in_(live),
         )
     ).all()
     for fps in rows:

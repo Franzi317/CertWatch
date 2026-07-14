@@ -66,7 +66,7 @@ export interface Cert {
   not_after: string | null; self_signed: boolean; internal_issued: boolean; is_wildcard: boolean; is_ca: boolean;
   chain_length: number; first_seen: string; last_seen: string; days_until_expiry: number | null;
   expired: boolean; severity: string; expiry_phrase: string; endpoint_count: number;
-  source: "network" | "ct"; pem?: string; endpoints?: Endpoint[]; observations?: Observation[];
+  source: "network" | "ct" | "chain"; pem?: string; endpoints?: Endpoint[]; observations?: Observation[];
 }
 export interface CaCertificate extends Cert {
   dependent_count: number;

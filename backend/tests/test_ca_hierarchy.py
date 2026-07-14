@@ -6,12 +6,28 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 from app import ca_hierarchy, scan_engine
-from app.models import Certificate
+from app.models import Certificate, Endpoint, Target
 from app.scanner import parse_certificate
 
 
 def _key():
     return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+def _target(db, name="grp"):
+    t = Target(name=name, target_type="hostname", value="host.example.com",
+               ports=[443], environment="prod")
+    db.add(t)
+    db.flush()
+    return t
+
+
+def _endpoint(db, target, cert, host="host.example.com", ip="10.0.0.5", port=443):
+    ep = Endpoint(target_id=target.id, host=host, ip=ip, port=port,
+                  current_cert_id=cert.id, last_status="ok")
+    db.add(ep)
+    db.flush()
+    return ep
 
 
 def _cert(subject_cn, issuer_cn, signer_key, subject_key, is_ca=False, days=3650):
@@ -74,17 +90,27 @@ def test_derive_dedups_shared_intermediate(db):
     int_der = intermediate.public_bytes(serialization.Encoding.DER)
     int_fp = parse_certificate(int_der)["fingerprint_sha256"]
 
+    leaves = []
     for cn in ("a.example.com", "b.example.com"):
         leaf_key = _key()
         leaf = _cert(cn, "Shared Intermediate CA", int_key, leaf_key, is_ca=False, days=90)
         leaf_der = leaf.public_bytes(serialization.Encoding.DER)
         # both leaves carry the SAME intermediate DER -> identical fingerprint
         fields = parse_certificate(leaf_der, [int_der])
-        db.add(Certificate(**fields, source="network"))
+        c = Certificate(**fields, source="network")
+        db.add(c)
+        leaves.append(c)
     db.commit()
 
     ca_hierarchy.derive(db)
     assert db.query(Certificate).filter_by(source="chain").count() == 1  # deduped
+
+    # bind both leaves to endpoints so they count as LIVE dependents
+    t = _target(db)
+    _endpoint(db, t, leaves[0], host="a.example.com", ip="10.0.0.1", port=443)
+    _endpoint(db, t, leaves[1], host="b.example.com", ip="10.0.0.2", port=443)
+    db.commit()
+
     assert ca_hierarchy.dependent_counts(db)[int_fp] == 2  # both leaves depend on it
 
 
@@ -129,5 +155,19 @@ def test_derive_skips_malformed_chain_member(db):
 def test_dependent_counts_rollup(db):
     leaf, int_fp = _leaf_with_chain(db)
     ca_hierarchy.derive(db)
+    # bind the leaf to an endpoint so it counts as a LIVE dependent
+    t = _target(db)
+    _endpoint(db, t, leaf)
+    db.commit()
     counts = ca_hierarchy.dependent_counts(db)
     assert counts.get(int_fp) == 1
+
+
+def test_dependent_counts_excludes_unbound_leaf(db):
+    # A derived leaf that is NOT bound to any endpoint (in inventory but not
+    # currently served) must not count as a dependent -- regression guard for
+    # the live-scoping fix. Fails on the old (unscoped) dependent_counts.
+    leaf, int_fp = _leaf_with_chain(db)
+    ca_hierarchy.derive(db)
+    counts = ca_hierarchy.dependent_counts(db)
+    assert counts.get(int_fp, 0) == 0
