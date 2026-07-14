@@ -6,17 +6,29 @@ from app.models import Certificate, utcnow
 
 def _seed(db):
     soon = utcnow() + datetime.timedelta(days=20)
+    orphan = utcnow() + datetime.timedelta(days=25)
+    root = utcnow() + datetime.timedelta(days=500)
     far = utcnow() + datetime.timedelta(days=800)
     ca_soon = Certificate(fingerprint_sha256="CA:SOON", common_name="Int Soon", issuer_cn="Root",
                           source="chain", is_ca=True, self_signed=False, not_after=soon)
+    # near-expiry (within 90d) but ZERO dependents: isolates the dashboard
+    # dependent-guard from the expiry window (a dropped guard would count it).
+    ca_orphan = Certificate(fingerprint_sha256="CA:SOON_ORPHAN", common_name="Int Orphan",
+                            issuer_cn="Root", source="chain", is_ca=True, self_signed=False,
+                            not_after=orphan)
+    # self-signed root CA (is_root path) with a dependent leaf so it surfaces.
+    ca_root = Certificate(fingerprint_sha256="CA:ROOT", common_name="The Root", issuer_cn="The Root",
+                          source="chain", is_ca=True, self_signed=True, not_after=root)
     ca_far = Certificate(fingerprint_sha256="CA:FAR", common_name="Int Far", issuer_cn="Root",
                          source="chain", is_ca=True, self_signed=False, not_after=far)
-    db.add_all([ca_soon, ca_far])
-    # two leaves depend on CA:SOON, none on CA:FAR
+    db.add_all([ca_soon, ca_orphan, ca_root, ca_far])
+    # two leaves depend on CA:SOON; one on CA:ROOT; none on CA:SOON_ORPHAN or CA:FAR
     db.add(Certificate(fingerprint_sha256="L1", common_name="l1", source="network",
                        chain_ca_fingerprints=["CA:SOON"]))
     db.add(Certificate(fingerprint_sha256="L2", common_name="l2", source="network",
                        chain_ca_fingerprints=["CA:SOON"]))
+    db.add(Certificate(fingerprint_sha256="L3", common_name="l3", source="network",
+                       chain_ca_fingerprints=["CA:ROOT"]))
     db.commit()
 
 
@@ -27,10 +39,18 @@ def test_ca_certificates_endpoint(client, monkeypatch):
     r = client.get("/api/ca-certificates")
     assert r.status_code == 200, r.text
     items = r.json()["items"]
-    assert [i["fingerprint_sha256"] for i in items] == ["CA:SOON", "CA:FAR"]  # sorted by expiry
-    soon = items[0]
+    # sorted by not_after ascending: SOON(20d) < ORPHAN(25d) < ROOT(500d) < FAR(800d)
+    assert [i["fingerprint_sha256"] for i in items] == [
+        "CA:SOON", "CA:SOON_ORPHAN", "CA:ROOT", "CA:FAR"
+    ]
+    by_fp = {i["fingerprint_sha256"]: i for i in items}
+    soon = by_fp["CA:SOON"]
     assert soon["dependent_count"] == 2
     assert soon["is_root"] is False
+    # zero-default: CA:FAR (intermediate, no dependents) -> dependent_count 0
+    assert by_fp["CA:FAR"]["dependent_count"] == 0
+    # is_root=True path: self-signed CA:ROOT
+    assert by_fp["CA:ROOT"]["is_root"] is True
 
 
 def test_dashboard_ca_expiring_count(client, monkeypatch):
@@ -38,5 +58,7 @@ def test_dashboard_ca_expiring_count(client, monkeypatch):
     login_as(client, "viewer", monkeypatch)
     s = SessionLocal(); _seed(s); s.close()
     data = client.get("/api/dashboard").json()
-    # CA:SOON (20d, 2 dependents) counts; CA:FAR (800d) does not
+    # Only CA:SOON (20d, 2 dependents) counts. CA:SOON_ORPHAN is also within 90d
+    # but has 0 dependents, so it must be excluded by the dependent guard;
+    # CA:ROOT (500d) and CA:FAR (800d) are outside the 90d window.
     assert data["ca_expiring_90d"] == 1
