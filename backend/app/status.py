@@ -63,6 +63,7 @@ def status_phrase(scan_status: str) -> str:
         "timeout": "Scan failed: connection timed out",
         "tls_handshake_failed": "Scan failed: TLS handshake failed",
         "non_tls_service": "Non-TLS service detected",
+        "starttls_failed": "Scan failed: STARTTLS not offered or refused",
         "no_certificate": "No certificate presented",
         "dns_resolution_failed": "Scan failed: could not resolve hostname",
     }.get(scan_status, scan_status or "Unknown")

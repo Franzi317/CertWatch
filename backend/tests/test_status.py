@@ -1,4 +1,4 @@
-from app.status import is_internal
+from app.status import is_internal, status_phrase
 
 PATTERNS = ["MyCorp Issuing CA", "SSL Corporation"]
 
@@ -18,3 +18,10 @@ def test_public_ca_is_external():
     assert is_internal("CN=Cloudflare TLS Issuing ECC CA 3", False, PATTERNS) is False
     # empty issuer, no patterns -> external
     assert is_internal("", False, []) is False
+
+
+def test_starttls_failed_has_friendly_phrase():
+    phrase = status_phrase("starttls_failed")
+    assert phrase == "Scan failed: STARTTLS not offered or refused"
+    # must not fall through to the raw status slug
+    assert phrase != "starttls_failed"
