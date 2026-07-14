@@ -71,6 +71,7 @@ def _readline(sock: socket.socket) -> bytes:
 
 
 def _smtp(sock: socket.socket, name: str) -> None:
+    name = name.replace("\r", "").replace("\n", "")  # prevent SMTP command injection via EHLO name
     line = _readline(sock)
     if not line.startswith(b"220"):
         raise StartTlsError(f"unexpected SMTP greeting: {line!r}")

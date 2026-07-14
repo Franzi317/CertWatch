@@ -76,6 +76,25 @@ def test_smtp_success_multiline_ehlo():
     assert sent["starttls"] == b"STARTTLS\r\n"
 
 
+def test_smtp_ehlo_strips_crlf_injection():
+    sent = {}
+
+    def script(conn):
+        conn.sendall(b"220 fake ESMTP ready\r\n")
+        sent["ehlo"] = _readline(conn)
+        conn.sendall(b"250 STARTTLS\r\n")
+        _readline(conn)
+        conn.sendall(b"220 go ahead\r\n")
+
+    port, t = _run_peer(script)
+    c = _client(port)
+    starttls.negotiate(c, "smtp", "evil\r\nMAIL FROM:<x>", 5.0)  # must not raise
+    c.close(); t.join(timeout=5)
+    # CR/LF stripped, so the name collapses to a single EHLO line; no injected command
+    assert sent["ehlo"] == b"EHLO evilMAIL FROM:<x>\r\n"
+    assert b"\r\nMAIL FROM" not in sent["ehlo"]
+
+
 def test_smtp_empty_host_uses_placeholder():
     sent = {}
 
