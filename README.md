@@ -105,6 +105,10 @@ days). Use **Validate / preview size** to see how many endpoints a target expand
 before saving — CIDR blocks larger than `CERTWATCH_MAX_CIDR_HOSTS` (default 4096) are
 refused.
 
+Ports that use STARTTLS — SMTP (25, 587), IMAP (143), POP3 (110), and LDAP (389) — are
+detected automatically by port number; CertWatch performs the plaintext STARTTLS
+handshake before capturing the certificate. No configuration is needed.
+
 Scans run in the background; watch live progress on the **Scan Jobs** page, where any
 running job can be cancelled. Scheduled rescans fire automatically based on each
 target's frequency.
@@ -251,6 +255,7 @@ source base URL; blank disables CT monitoring, default `https://crt.sh`),
 | `timeout` | No response within the target's timeout. Raise the timeout or check reachability. |
 | `tls_handshake_failed` | Port open but TLS negotiation failed (protocol/cipher mismatch). |
 | `non_tls_service` | Port is open but speaks a non-TLS protocol (e.g. plain HTTP). |
+| `starttls_failed` | Port speaks its plaintext protocol (SMTP/IMAP/POP3/LDAP) but STARTTLS was not offered or was refused. The service may have STARTTLS disabled, or requires it be enabled server-side. |
 | `no_certificate` | TLS completed but no certificate was presented. |
 | `dns_resolution_failed` | Hostname did not resolve. Check DNS. |
 
