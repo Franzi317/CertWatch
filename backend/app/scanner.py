@@ -7,7 +7,7 @@ the reference Go scanner's `InsecureSkipVerify` probe, ported to `ssl`.
 
 Error codes are a stable taxonomy consumed by the UI:
   ok, connection_failed, timeout, tls_handshake_failed, non_tls_service,
-  no_certificate, dns_resolution_failed.
+  no_certificate, dns_resolution_failed, starttls_failed.
 """
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519, rsa
 from cryptography.x509.oid import ExtensionOID, NameOID
+
+from . import starttls
 
 
 @dataclass
@@ -144,6 +146,15 @@ def scan_endpoint(ip: str, port: int, sni: str = "", timeout: float = 5.0) -> Sc
         return ScanResult(status="connection_failed", error=str(e))
 
     raw.settimeout(timeout)
+
+    proto = starttls.protocol_for_port(port)
+    if proto:
+        try:
+            starttls.negotiate(raw, proto, sni, timeout)  # defaults EHLO name when sni is ""
+        except starttls.StartTlsError as e:
+            raw.close()
+            return ScanResult(status="starttls_failed", error=str(e), sni_used=sni)
+
     try:
         server_hostname = sni or None
         with ctx.wrap_socket(raw, server_hostname=server_hostname) as tls:
