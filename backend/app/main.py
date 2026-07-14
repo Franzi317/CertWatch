@@ -65,6 +65,7 @@ DEFAULT_SETTINGS = {
     "alert_on_self_signed": False,
     "app_base_url": "http://localhost:5173",
     "default_ports": [443, 8443, 9443, 636, 993, 995, 465, 587, 3389, 5986],
+    "ca_alert_thresholds": "180,90,30",
 }
 
 # CSV column sets for ?format=csv on the list endpoints (Phase 2, Task 1).

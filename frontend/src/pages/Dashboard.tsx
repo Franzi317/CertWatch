@@ -52,6 +52,7 @@ export default function Dashboard() {
               <StatCard label="Certificates" value={d.total_certificates} />
               <StatCard label="Endpoints scanned" value={d.total_endpoints} />
               <StatCard label="Expiring ≤ 90 days" value={d.expiring_90d} severity="info" />
+              <StatCard label="CA certs expiring ≤90d" value={d.ca_expiring_90d} severity={d.ca_expiring_90d ? "warning" : "healthy"} />
               <StatCard label="Expiring ≤ 30 days" value={d.expiring_30d} severity="warning" />
               <StatCard label="Expiring ≤ 7 days" value={d.expiring_7d} severity="critical" />
               <StatCard label="Expired" value={d.expired} severity="critical" />

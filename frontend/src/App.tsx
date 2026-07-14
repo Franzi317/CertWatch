@@ -4,6 +4,7 @@ import Dashboard from "./pages/Dashboard";
 import Targets from "./pages/Targets";
 import Certificates from "./pages/Certificates";
 import CertificateDetail from "./pages/CertificateDetail";
+import CaCertificates from "./pages/CaCertificates";
 import Endpoints from "./pages/Endpoints";
 import EndpointDetail from "./pages/EndpointDetail";
 import ScanJobs from "./pages/ScanJobs";
@@ -22,6 +23,7 @@ const nav = [
   ["/", "Dashboard"],
   ["/targets", "Targets"],
   ["/certificates", "Certificates"],
+  ["/ca-certificates", "CA Certificates"],
   ["/endpoints", "Endpoints"],
   ["/scans", "Scan Jobs"],
   ["/alerts", "Alerts"],
@@ -98,6 +100,7 @@ function AppShell() {
           <Route path="/targets" element={<Targets />} />
           <Route path="/certificates" element={<Certificates />} />
           <Route path="/certificates/:id" element={<CertificateDetail />} />
+          <Route path="/ca-certificates" element={<CaCertificates />} />
           <Route path="/endpoints" element={<Endpoints />} />
           <Route path="/endpoints/:id" element={<EndpointDetail />} />
           <Route path="/scans" element={<ScanJobs />} />

@@ -147,6 +147,32 @@ CertWatch doesn't control or operate that certificate. Dashboard expiry/health t
 so CT-only certs never inflate those operational counts — they're tracked via the
 finding instead.
 
+### CA hierarchy
+
+During a scan, CertWatch captures each endpoint's full certificate chain (not just
+the leaf) and stores the intermediate/root CA certificates it discovers with
+`source=chain` — a third cert origin alongside `source=network` (leaf certs observed
+directly on an endpoint) and `source=ct` (leaf certs discovered via CT logs above).
+
+The **CA Certificates** page lists every CA cert seen in a captured chain — flat, not
+a tree — with its subject/CN, issuer, expiry status, a **Root**/**Intermediate** label
+(root = self-signed CA), and a **dependent count**: how many currently-observed leaf
+certificates chain up through it. A CA nearing expiry with zero dependents is noise,
+not a risk, so it's excluded from alerting (see below) but still listed for visibility.
+
+When a CA certificate with at least one dependent leaf crosses an expiry threshold, an
+`issuer_expiring` alert fires — the same anti-spam/auto-resolve alert lifecycle as
+other rules, and it lists the affected leaf certificates. Thresholds are configured via
+the `ca_alert_thresholds` setting (comma-separated days, default `180,90,30` — wider
+than leaf-cert thresholds since replacing a CA has more downstream impact and lead
+time to plan). The dashboard's **CA certs expiring ≤90d** tile applies the same
+dependent-count guard.
+
+Full chain capture (and therefore the entire CA hierarchy feature) requires
+**Python 3.13+** (`get_unverified_chain`); on older runtimes only the leaf certificate
+is captured, so the CA Certificates page and `issuer_expiring` alerts stay empty. See
+[Known limitations](#known-limitations).
+
 ---
 
 ## How alerting works
@@ -159,6 +185,9 @@ After every scan, CertWatch evaluates alert rules against current state:
 - **Changed** — an endpoint's certificate fingerprint changed since the previous scan.
 - **Scan failure** — an endpoint has failed `scan_failure_threshold` consecutive scans.
 - **Self-signed** *(optional)* — enable in Settings.
+- **Issuer expiring** — a CA certificate (`source=chain`) with at least one dependent
+  leaf crosses a threshold in `ca_alert_thresholds` (default `180,90,30` days). See
+  [CA hierarchy](#ca-hierarchy).
 
 **Anti-spam:** each condition maps to a stable key stored as one alert event. It
 notifies once on creation, then only again after the channel's **re-alert interval**
@@ -199,6 +228,7 @@ All under `/api`. When `CERTWATCH_API_KEY` is set, send `Authorization: Bearer <
 | POST | `/scans/{id}/cancel` | cancel a running scan |
 | GET | `/scans`, `/scans/{id}` | list / status of scan jobs |
 | GET | `/certificates`, `/certificates/{id}` | inventory + detail (filters: `q`, `expiring_within`, `expired`, `self_signed`, `issuer`, `sort`, `limit`, `offset`) |
+| GET | `/ca-certificates` | CA hierarchy: `source=chain` certs with `dependent_count` + `is_root`, sorted by soonest expiry |
 | GET | `/endpoints`, `/endpoints/{id}` | endpoint inventory + detail |
 | GET | `/alerts` | list alerts |
 | POST | `/alerts/{id}/ack` · `/mute` · `/unmute` | alert actions |
