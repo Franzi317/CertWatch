@@ -14,6 +14,17 @@ def test_pagerduty_routing_key_scrubbed(client, monkeypatch):
     assert all("routing_key" not in c["config_summary"] for c in lst)
 
 
+def test_pagerduty_default_min_severity_critical(client, monkeypatch):
+    from tests.conftest import login_as
+    login_as(client, "operator", monkeypatch)
+    r = client.post("/api/channels", json={
+        "name": "pd-default", "channel_type": "pagerduty", "enabled": True, "re_alert_hours": 24,
+        "config": {"routing_key": "RK"},  # no min_severity supplied
+    })
+    assert r.status_code == 201, r.text
+    assert r.json()["config_summary"]["min_severity"] == "critical"
+
+
 def test_test_channel_pagerduty(client, monkeypatch):
     from tests.conftest import login_as
     from app import main as app_main

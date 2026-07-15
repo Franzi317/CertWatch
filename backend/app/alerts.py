@@ -122,10 +122,11 @@ def evaluate_alerts(db: Session, now: datetime | None = None, dispatch: bool = T
             db.add(AlertEvent(dedupe_key=key, resolved=False, **d))
             created += 1
         elif ev.resolved:
-            # condition recurred — reopen and reset notification clock
+            # condition recurred — reopen and reset notification + resolution clocks
             ev.resolved = False
             ev.notify_count = 0
             ev.last_notified_at = None
+            ev.resolution_notified_at = None
             ev.message, ev.severity = d["message"], d["severity"]
         else:
             ev.message, ev.severity = d["message"], d["severity"]

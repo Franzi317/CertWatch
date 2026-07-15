@@ -768,8 +768,11 @@ def create_channel(
     principal: dict = Depends(require_role("operator")),
 ):
     data = body.model_dump()
+    config = data.get("config") or {}
+    if data.get("channel_type") == "pagerduty" and not config.get("min_severity"):
+        config["min_severity"] = "critical"
     try:
-        data["config"] = _encrypt_secrets(data.get("config") or {})
+        data["config"] = _encrypt_secrets(config)
     except SecretsNotConfigured as e:
         raise HTTPException(400, str(e))
     ch = NotificationChannel(**data)

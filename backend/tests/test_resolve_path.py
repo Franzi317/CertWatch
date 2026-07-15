@@ -1,5 +1,5 @@
 from app import alerts
-from app.models import AlertEvent, Certificate, NotificationChannel, utcnow
+from app.models import AlertEvent, Certificate, Endpoint, NotificationChannel, utcnow
 
 
 def _resolved_alert(db, severity="critical", notify_count=1):
@@ -70,3 +70,47 @@ def test_evaluate_alerts_reports_resolution_count(db, monkeypatch):
     _resolved_alert(db)
     result = alerts.evaluate_alerts(db)
     assert result.get("resolution_notified") == 1
+
+
+def test_reopen_allows_second_resolution(db, monkeypatch):
+    """Regression: a recurring condition (fail -> recover -> fail -> recover) must
+    fire a SECOND resolve dispatch. Before the fix, the `evaluate_alerts` reopen
+    branch left `resolution_notified_at` set from the first resolve, so
+    dispatch_resolutions' `resolution_notified_at IS NULL` filter silently dropped
+    the second resolution -- the PD incident never auto-closed the second time."""
+    calls = []
+    monkeypatch.setattr(alerts, "send_pagerduty",
+                        lambda cfg, action, key, **kw: calls.append((action, key)))
+    _channel(db, "pagerduty", routing_key="RK", min_severity="info")
+
+    ep = Endpoint(host="flaky.example.com", ip="10.0.0.9", port=443,
+                  last_status="fail", consecutive_failures=3)
+    db.add(ep); db.commit()
+    key = f"scan_failure:{ep.id}"
+
+    # first failure -> trigger
+    alerts.evaluate_alerts(db)
+    assert ("trigger", key) in calls
+
+    # recovers -> first resolve
+    ep.last_status = "ok"
+    db.commit()
+    alerts.evaluate_alerts(db)
+    assert calls.count(("resolve", key)) == 1
+    ev = db.query(AlertEvent).filter_by(dedupe_key=key).one()
+    assert ev.resolution_notified_at is not None
+
+    # recurs -> reopen; must clear resolution_notified_at (the fix under test)
+    ep.last_status = "fail"
+    ep.consecutive_failures = 3
+    db.commit()
+    alerts.evaluate_alerts(db)
+    db.refresh(ev)
+    assert ev.resolved is False
+    assert ev.resolution_notified_at is None
+
+    # recovers again -> a SECOND resolve must be dispatched
+    ep.last_status = "ok"
+    db.commit()
+    alerts.evaluate_alerts(db)
+    assert calls.count(("resolve", key)) == 2

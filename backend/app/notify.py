@@ -85,7 +85,7 @@ def send_webhook(config: dict, title: str, text: str, facts: dict | None = None,
         payload = {
             "@type": "MessageCard",
             "@context": "http://schema.org/extensions",
-            "themeColor": color or config.get("theme_color", "D7263D"),
+            "themeColor": config.get("theme_color") or color or "D7263D",
             "summary": title,
             "sections": [{
                 "activityTitle": title,
