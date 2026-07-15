@@ -51,7 +51,7 @@ from .models import (
     utcnow,
 )
 from .metrics import setup_metrics
-from .notify import NotifyError, send_email, send_webhook
+from .notify import NotifyError, send_email, send_pagerduty, send_webhook
 from .scheduler import enqueue_scan, shutdown_scheduler, start_scheduler
 from .serialize import cert_dict, endpoint_dict, observation_dict
 from .status import days_until
@@ -725,7 +725,7 @@ def check_watched_domain(
 # --------------------------------------------------------------------------- #
 # Notification channels
 # --------------------------------------------------------------------------- #
-_SECRET_KEYS = {"password", "url"}
+_SECRET_KEYS = {"password", "url", "routing_key"}
 
 
 def _encrypt_secrets(config: dict) -> dict:
@@ -829,7 +829,13 @@ def test_channel(channel_id: int, db: Session = Depends(get_db)):
         if ch.channel_type == "smtp":
             send_email(ch.config, "CertWatch test email",
                        "This is a test notification from CertWatch. SMTP is configured correctly.")
-        else:
+        elif ch.channel_type == "pagerduty":
+            # trigger + immediate resolve so the test leaves no dangling incident
+            send_pagerduty(ch.config, "trigger", f"certwatch-test-{ch.id}",
+                           summary="CertWatch test alert", severity="info",
+                           facts={"Channel": ch.name}, link=_base_url(db))
+            send_pagerduty(ch.config, "resolve", f"certwatch-test-{ch.id}")
+        else:  # teams | webhook | slack
             send_webhook(ch.config, "CertWatch test notification",
                          "This is a test notification from CertWatch. The webhook is configured correctly.",
                          {"Channel": ch.name}, _base_url(db))
