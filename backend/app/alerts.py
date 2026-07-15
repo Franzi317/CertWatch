@@ -23,7 +23,7 @@ from .models import (
     Target,
     utcnow,
 )
-from .notify import NotifyError, send_email, send_webhook
+from .notify import NotifyError, send_email, send_pagerduty, send_webhook
 from .status import days_until, expiry_phrase, severity
 
 log = logging.getLogger("certwatch.alerts")
@@ -34,6 +34,19 @@ log = logging.getLogger("certwatch.alerts")
 # below, since they have no corresponding entry in `desired` -- resolving them
 # there would silently prevent `dispatch_alerts` from ever sending them.
 ONE_OFF_RULE_TYPES = {"changed", "renewal_failed", "deploy_failed", "order_stuck"}
+
+_SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
+_SEVERITY_COLOR = {"info": "3B82F6", "warning": "F59E0B", "critical": "D7263D"}
+_RESOLVED_COLOR = "2EB67D"
+
+
+def _severity_ok(channel, severity: str) -> bool:
+    floor = (channel.config or {}).get("min_severity") or "info"
+    return _SEVERITY_RANK.get(severity, 0) >= _SEVERITY_RANK.get(floor, 0)
+
+
+def _sev_color(severity: str) -> str:
+    return _SEVERITY_COLOR.get(severity, "D7263D")
 
 
 def get_setting(db: Session, key: str, default):
@@ -199,11 +212,16 @@ def dispatch_alerts(db: Session, now: datetime | None = None) -> int:
         subject, text, html, facts, link = _format(db, ev)
         delivered = False
         for ch in channels:
+            if not _severity_ok(ch, ev.severity):
+                continue
             try:
                 if ch.channel_type == "smtp":
                     send_email(ch.config, subject, text, html)
-                else:
-                    send_webhook(ch.config, subject, text, facts, link)
+                elif ch.channel_type == "pagerduty":
+                    send_pagerduty(ch.config, "trigger", ev.dedupe_key,
+                                   summary=subject, severity=ev.severity, facts=facts, link=link)
+                else:  # teams | webhook | slack
+                    send_webhook(ch.config, subject, text, facts, link, color=_sev_color(ev.severity))
                 delivered = True
             except NotifyError as e:
                 log.warning("channel %s failed for alert %s: %s", ch.name, ev.id, e)
