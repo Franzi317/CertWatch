@@ -186,6 +186,11 @@ class AlertEvent(Base):
     resolved: Mapped[bool] = mapped_column(Boolean, default=False)
     notify_count: Mapped[int] = mapped_column(Integer, default=0)
     last_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Set once dispatch_resolutions has notified channels that this alert cleared
+    # (PagerDuty resolve event / "Resolved" message). NULL = resolution not yet
+    # dispatched. Separate from resolved/updated_at so the resolve notice is sent
+    # exactly once.
+    resolution_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
