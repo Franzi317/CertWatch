@@ -748,6 +748,8 @@ def _channel_out(ch: NotificationChannel) -> dict:
         summary["url_set"] = bool(ch.config.get("url"))
     if "password" in (ch.config or {}):
         summary["password_set"] = bool(ch.config.get("password"))
+    if "routing_key" in (ch.config or {}):
+        summary["routing_key_set"] = bool(ch.config.get("routing_key"))
     return {
         "id": ch.id, "name": ch.name, "channel_type": ch.channel_type,
         "enabled": ch.enabled, "re_alert_hours": ch.re_alert_hours, "config_summary": summary,

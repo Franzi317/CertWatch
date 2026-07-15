@@ -7,8 +7,9 @@ ranges, on one or many ports — connects to each reachable endpoint, captures t
 presented TLS certificate **without requiring it to be trusted**, and builds a
 deduplicated inventory keyed by SHA-256 fingerprint. It tracks every certificate
 across every endpoint it is bound to, preserves a full history of observations, and
-alerts via **email** and **Microsoft Teams / generic webhook** as certificates
-approach expiry, expire, change unexpectedly, or when scans persistently fail.
+alerts via **email**, **Microsoft Teams / generic webhook**, **Slack**, and
+**PagerDuty** as certificates approach expiry, expire, change unexpectedly, or when
+scans persistently fail.
 
 > ⚠️ **Authorization notice.** CertWatch is for **authorized internal inventory
 > only.** Only define targets for networks and hosts you are permitted to assess.
@@ -26,7 +27,7 @@ approach expiry, expire, change unexpectedly, or when scans persistently fail.
               ├─ scanner.py      native ssl/socket TLS capture (no shelling out)
               ├─ scan_engine.py  concurrent scan jobs, dedup, observation history
               ├─ alerts.py       threshold + suppression logic, dispatch
-              ├─ notify.py       SMTP + Teams/webhook senders (stdlib)
+              ├─ notify.py       SMTP + Teams/webhook/Slack/PagerDuty senders (stdlib)
               ├─ scheduler.py    in-process APScheduler (scheduled rescans)
               └─ models.py       SQLAlchemy data model
                          │
@@ -193,7 +194,9 @@ After every scan, CertWatch evaluates alert rules against current state:
 notifies once on creation, then only again after the channel's **re-alert interval**
 (default 24h). Alerts can be **acknowledged** (stop notifying) or **muted** (for N
 hours or indefinitely). When a cert is renewed or a scan recovers, the matching alert
-**auto-resolves**.
+**auto-resolves** — every enabled channel (Teams/webhook, email, Slack, PagerDuty)
+receives a one-time "Resolved" notice; PagerDuty additionally auto-resolves the
+underlying incident.
 
 Every alert message includes the CN/SAN, endpoint host/IP and port, expiration date,
 days remaining, issuer, fingerprint, target group, owner/team, environment, a link to
@@ -212,6 +215,22 @@ blank password leaves the existing one untouched).
 **Teams MessageCard** (rich card with an "View certificate" action) or **Generic JSON**
 (`{title, text, facts, link}`) for any other consumer. Use **Test** to verify. The URL
 is treated as a secret and never returned by the API.
+
+### Configuring Slack
+
+**Settings → + Slack.** Paste an incoming-webhook URL
+(`https://hooks.slack.com/services/...`) and optionally set a **minimum severity**
+floor (info/warning/critical) so low-priority alerts don't reach the channel. Use
+**Test** to verify. The URL is treated as a secret and never returned by the API.
+
+### Configuring PagerDuty
+
+**Settings → + PagerDuty.** Paste an **Events API v2** integration/routing key from a
+PagerDuty service. Defaults to **critical-only** (adjustable via minimum severity) so
+routine warnings don't page anyone. CertWatch triggers an incident on alert and
+**auto-resolves** it when the underlying condition clears. An optional Events API URL
+override is available for non-default regions/proxies. Use **Test** to verify. The
+routing key is treated as a secret and never returned by the API.
 
 ---
 
@@ -250,8 +269,9 @@ Interactive docs at `/docs` (Swagger UI).
 - TLS capture uses native `ssl`/`socket` with verification disabled *only to observe*
   untrusted certs (expired, self-signed, mismatched, incomplete-chain are all
   inventoried). CertWatch never treats observed certs as trusted.
-- Secrets (SMTP password, webhook URL) come from per-channel config or env vars, are
-  scrubbed from all API responses, and are not logged.
+- Secrets (SMTP password, webhook/Slack URL, PagerDuty routing key) come from
+  per-channel config or env vars, are scrubbed from all API responses, and are not
+  logged.
 - Optional bearer-token API auth (`CERTWATCH_API_KEY`). Target and channel changes are
   written to an audit log.
 - Sensible CORS defaults; configurable via `CERTWATCH_CORS_ORIGINS`.

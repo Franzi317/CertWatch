@@ -13,6 +13,14 @@ const HOOK_BLANK: ChannelDraft = {
   name: "Teams webhook", channel_type: "teams", enabled: true, re_alert_hours: 24,
   config: { url: "", format: "teams" },
 };
+const SLACK_BLANK: ChannelDraft = {
+  name: "Slack", channel_type: "slack", enabled: true, re_alert_hours: 24,
+  config: { url: "", format: "slack", min_severity: "" },
+};
+const PAGERDUTY_BLANK: ChannelDraft = {
+  name: "PagerDuty", channel_type: "pagerduty", enabled: true, re_alert_hours: 24,
+  config: { routing_key: "", events_url: "", min_severity: "critical" },
+};
 
 export default function Settings() {
   const [channels, setChannels] = useState<Channel[]>([]);
@@ -90,6 +98,8 @@ export default function Settings() {
             <div className="spacer" />
             <button className="secondary" onClick={() => setDraft({ ...SMTP_BLANK })}>+ SMTP</button>
             <button className="secondary" onClick={() => setDraft({ ...HOOK_BLANK })}>+ Teams / Webhook</button>
+            <button className="secondary" onClick={() => setDraft({ ...SLACK_BLANK })}>+ Slack</button>
+            <button className="secondary" onClick={() => setDraft({ ...PAGERDUTY_BLANK })}>+ PagerDuty</button>
           </div>
           <table style={{ marginTop: 12 }}>
             <thead><tr><th>Name</th><th>Type</th><th>Enabled</th><th>Re-alert</th><th>Config</th><th></th></tr></thead>
@@ -178,6 +188,34 @@ export default function Settings() {
               <div className="field"><label>Password {draft.id && <span className="muted">(blank = unchanged)</span>}</label><input type="password" value={draft.config.password || ""} onChange={(e) => setCfg({ password: e.target.value })} style={{ width: "100%" }} /></div>
               <div className="field"><label>From address</label><input value={draft.config.from_address || ""} onChange={(e) => setCfg({ from_address: e.target.value })} style={{ width: "100%" }} /></div>
               <div className="field"><label>Recipients (comma-separated)</label><input value={(draft.config.recipients || []).join(",")} onChange={(e) => setCfg({ recipients: e.target.value.split(",").map((x: string) => x.trim()).filter(Boolean) })} style={{ width: "100%" }} /></div>
+            </div>
+          ) : draft.channel_type === "slack" ? (
+            <div className="form-grid">
+              <div className="field" style={{ gridColumn: "1 / 3" }}>
+                <label>Incoming webhook URL {draft.config.url_set ? <span className="muted">(configured — leave blank to keep)</span> : draft.id && <span className="muted">(blank = unchanged)</span>}</label>
+                <input type="password" value={draft.config.url || ""} onChange={(e) => setCfg({ url: e.target.value })} style={{ width: "100%" }} /></div>
+              <div className="field"><label>Minimum severity</label>
+                <select value={draft.config.min_severity || ""} onChange={(e) => setCfg({ min_severity: e.target.value })} style={{ width: "100%" }}>
+                  <option value="">All severities</option>
+                  <option value="info">Info and above</option>
+                  <option value="warning">Warning and above</option>
+                  <option value="critical">Critical only</option>
+                </select></div>
+            </div>
+          ) : draft.channel_type === "pagerduty" ? (
+            <div className="form-grid">
+              <div className="field" style={{ gridColumn: "1 / 3" }}>
+                <label>Routing / integration key {draft.config.routing_key_set ? <span className="muted">(configured — leave blank to keep)</span> : draft.id && <span className="muted">(blank = unchanged)</span>}</label>
+                <input type="password" value={draft.config.routing_key || ""} onChange={(e) => setCfg({ routing_key: e.target.value })} style={{ width: "100%" }} /></div>
+              <div className="field"><label>Events API URL <span className="muted">(optional — defaults to events.pagerduty.com)</span></label>
+                <input value={draft.config.events_url || ""} onChange={(e) => setCfg({ events_url: e.target.value })} style={{ width: "100%" }} /></div>
+              <div className="field"><label>Minimum severity</label>
+                <select value={draft.config.min_severity || "critical"} onChange={(e) => setCfg({ min_severity: e.target.value })} style={{ width: "100%" }}>
+                  <option value="">All severities</option>
+                  <option value="info">Info and above</option>
+                  <option value="warning">Warning and above</option>
+                  <option value="critical">Critical only</option>
+                </select></div>
             </div>
           ) : (
             <div className="form-grid">

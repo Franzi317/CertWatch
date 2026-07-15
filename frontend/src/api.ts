@@ -99,6 +99,8 @@ export interface Alert {
   notify_count: number; last_notified_at: string | null; created_at: string;
 }
 export interface Channel {
+  // channel_type is a free string on the backend (no enum/union to widen here);
+  // known values: "smtp" | "teams" | "webhook" | "slack" | "pagerduty".
   id: number; name: string; channel_type: string; enabled: boolean; re_alert_hours: number;
   config_summary: Record<string, any>;
 }
