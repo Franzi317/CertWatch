@@ -51,7 +51,7 @@ from .models import (
     utcnow,
 )
 from .metrics import setup_metrics
-from .notify import NotifyError, send_email, send_webhook
+from .notify import NotifyError, send_email, send_pagerduty, send_webhook
 from .scheduler import enqueue_scan, shutdown_scheduler, start_scheduler
 from .serialize import cert_dict, endpoint_dict, observation_dict
 from .status import days_until
@@ -725,7 +725,7 @@ def check_watched_domain(
 # --------------------------------------------------------------------------- #
 # Notification channels
 # --------------------------------------------------------------------------- #
-_SECRET_KEYS = {"password", "url"}
+_SECRET_KEYS = {"password", "url", "routing_key"}
 
 
 def _encrypt_secrets(config: dict) -> dict:
@@ -748,6 +748,8 @@ def _channel_out(ch: NotificationChannel) -> dict:
         summary["url_set"] = bool(ch.config.get("url"))
     if "password" in (ch.config or {}):
         summary["password_set"] = bool(ch.config.get("password"))
+    if "routing_key" in (ch.config or {}):
+        summary["routing_key_set"] = bool(ch.config.get("routing_key"))
     return {
         "id": ch.id, "name": ch.name, "channel_type": ch.channel_type,
         "enabled": ch.enabled, "re_alert_hours": ch.re_alert_hours, "config_summary": summary,
@@ -766,8 +768,11 @@ def create_channel(
     principal: dict = Depends(require_role("operator")),
 ):
     data = body.model_dump()
+    config = data.get("config") or {}
+    if data.get("channel_type") == "pagerduty" and not config.get("min_severity"):
+        config["min_severity"] = "critical"
     try:
-        data["config"] = _encrypt_secrets(data.get("config") or {})
+        data["config"] = _encrypt_secrets(config)
     except SecretsNotConfigured as e:
         raise HTTPException(400, str(e))
     ch = NotificationChannel(**data)
@@ -829,7 +834,13 @@ def test_channel(channel_id: int, db: Session = Depends(get_db)):
         if ch.channel_type == "smtp":
             send_email(ch.config, "CertWatch test email",
                        "This is a test notification from CertWatch. SMTP is configured correctly.")
-        else:
+        elif ch.channel_type == "pagerduty":
+            # trigger + immediate resolve so the test leaves no dangling incident
+            send_pagerduty(ch.config, "trigger", f"certwatch-test-{ch.id}",
+                           summary="CertWatch test alert", severity="info",
+                           facts={"Channel": ch.name}, link=_base_url(db))
+            send_pagerduty(ch.config, "resolve", f"certwatch-test-{ch.id}")
+        else:  # teams | webhook | slack
             send_webhook(ch.config, "CertWatch test notification",
                          "This is a test notification from CertWatch. The webhook is configured correctly.",
                          {"Channel": ch.name}, _base_url(db))

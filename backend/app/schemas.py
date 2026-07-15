@@ -55,7 +55,7 @@ class ScanJobOut(BaseModel):
 
 class ChannelIn(BaseModel):
     name: str
-    channel_type: str  # smtp | teams | webhook
+    channel_type: str  # smtp | teams | webhook | slack | pagerduty
     enabled: bool = True
     config: dict = Field(default_factory=dict)
     re_alert_hours: int = 24

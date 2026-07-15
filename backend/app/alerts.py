@@ -23,7 +23,7 @@ from .models import (
     Target,
     utcnow,
 )
-from .notify import NotifyError, send_email, send_webhook
+from .notify import NotifyError, send_email, send_pagerduty, send_webhook
 from .status import days_until, expiry_phrase, severity
 
 log = logging.getLogger("certwatch.alerts")
@@ -34,6 +34,19 @@ log = logging.getLogger("certwatch.alerts")
 # below, since they have no corresponding entry in `desired` -- resolving them
 # there would silently prevent `dispatch_alerts` from ever sending them.
 ONE_OFF_RULE_TYPES = {"changed", "renewal_failed", "deploy_failed", "order_stuck"}
+
+_SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
+_SEVERITY_COLOR = {"info": "3B82F6", "warning": "F59E0B", "critical": "D7263D"}
+_RESOLVED_COLOR = "2EB67D"
+
+
+def _severity_ok(channel, severity: str) -> bool:
+    floor = (channel.config or {}).get("min_severity") or "info"
+    return _SEVERITY_RANK.get(severity, 0) >= _SEVERITY_RANK.get(floor, 0)
+
+
+def _sev_color(severity: str) -> str:
+    return _SEVERITY_COLOR.get(severity, "D7263D")
 
 
 def get_setting(db: Session, key: str, default):
@@ -109,10 +122,11 @@ def evaluate_alerts(db: Session, now: datetime | None = None, dispatch: bool = T
             db.add(AlertEvent(dedupe_key=key, resolved=False, **d))
             created += 1
         elif ev.resolved:
-            # condition recurred — reopen and reset notification clock
+            # condition recurred — reopen and reset notification + resolution clocks
             ev.resolved = False
             ev.notify_count = 0
             ev.last_notified_at = None
+            ev.resolution_notified_at = None
             ev.message, ev.severity = d["message"], d["severity"]
         else:
             ev.message, ev.severity = d["message"], d["severity"]
@@ -129,7 +143,9 @@ def evaluate_alerts(db: Session, now: datetime | None = None, dispatch: bool = T
     db.commit()
 
     sent = dispatch_alerts(db, now) if dispatch else 0
-    return {"created": created, "resolved": resolved, "notified": sent}
+    resolution_sent = dispatch_resolutions(db, now) if dispatch else 0
+    return {"created": created, "resolved": resolved, "notified": sent,
+            "resolution_notified": resolution_sent}
 
 
 def raise_alert(
@@ -199,11 +215,16 @@ def dispatch_alerts(db: Session, now: datetime | None = None) -> int:
         subject, text, html, facts, link = _format(db, ev)
         delivered = False
         for ch in channels:
+            if not _severity_ok(ch, ev.severity):
+                continue
             try:
                 if ch.channel_type == "smtp":
                     send_email(ch.config, subject, text, html)
-                else:
-                    send_webhook(ch.config, subject, text, facts, link)
+                elif ch.channel_type == "pagerduty":
+                    send_pagerduty(ch.config, "trigger", ev.dedupe_key,
+                                   summary=subject, severity=ev.severity, facts=facts, link=link)
+                else:  # teams | webhook | slack
+                    send_webhook(ch.config, subject, text, facts, link, color=_sev_color(ev.severity))
                 delivered = True
             except NotifyError as e:
                 log.warning("channel %s failed for alert %s: %s", ch.name, ev.id, e)
@@ -215,11 +236,48 @@ def dispatch_alerts(db: Session, now: datetime | None = None) -> int:
     return sent
 
 
+def dispatch_resolutions(db: Session, now: datetime | None = None) -> int:
+    """Close-the-loop: for each alert that has resolved but whose resolution
+    hasn't been announced, tell channels it cleared -- PagerDuty a 'resolve'
+    event (auto-closes the incident), message channels a 'Resolved' notice.
+    Stamped once via resolution_notified_at. Does NOT skip acked/muted alerts:
+    closing an external incident must happen regardless of local ack/mute; the
+    notify_count>0 gate limits this to alerts that were actually delivered."""
+    now = now or utcnow()
+    channels = db.scalars(select(NotificationChannel).where(NotificationChannel.enabled.is_(True))).all()
+    if not channels:
+        return 0
+    pending = db.scalars(select(AlertEvent).where(
+        AlertEvent.resolved.is_(True),
+        AlertEvent.resolution_notified_at.is_(None),
+        AlertEvent.notify_count > 0,
+    )).all()
+    sent = 0
+    for ev in pending:
+        subject, text, html, facts, link = _format(db, ev, resolved=True)
+        for ch in channels:
+            if not _severity_ok(ch, ev.severity):
+                continue
+            try:
+                if ch.channel_type == "smtp":
+                    send_email(ch.config, subject, text, html)
+                elif ch.channel_type == "pagerduty":
+                    send_pagerduty(ch.config, "resolve", ev.dedupe_key)
+                else:  # teams | webhook | slack
+                    send_webhook(ch.config, subject, text, facts, link, color=_RESOLVED_COLOR)
+            except NotifyError as e:
+                log.warning("resolve dispatch: channel %s failed for alert %s: %s", ch.name, ev.id, e)
+        ev.resolution_notified_at = now
+        sent += 1
+    db.commit()
+    return sent
+
+
 def _aware(dt: datetime) -> datetime:
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
-def _format(db: Session, ev: AlertEvent):
+def _format(db: Session, ev: AlertEvent, resolved: bool = False):
     ep = db.get(Endpoint, ev.endpoint_id) if ev.endpoint_id else None
     cert = db.get(Certificate, ev.certificate_id) if ev.certificate_id else None
     target = db.get(Target, ep.target_id) if (ep and ep.target_id) else None
@@ -256,12 +314,15 @@ def _format(db: Session, ev: AlertEvent):
         "Environment": target.environment if target else "n/a",
         "Severity": ev.severity,
     }
-    subject = f"[CertWatch {ev.severity.upper()}] {ev.rule_type} — {cn or where}"
-    text_lines = [ev.message, "", *(f"{k}: {v}" for k, v in facts.items()), "",
+    tag = "RESOLVED" if resolved else ev.severity.upper()
+    subject = f"[CertWatch {tag}] {ev.rule_type} — {cn or where}"
+    lead = ("This condition has cleared (certificate renewed, scan recovered, or CA renewed). " + ev.message
+            if resolved else ev.message)
+    text_lines = [lead, "", *(f"{k}: {v}" for k, v in facts.items()), "",
                   f"Recommended action: {action}", f"Details: {link}"]
     text = "\n".join(text_lines)
     rows = "".join(f"<tr><td><b>{k}</b></td><td>{v}</td></tr>" for k, v in facts.items())
-    html = (f"<h3>{subject}</h3><p>{ev.message}</p><table>{rows}</table>"
+    html = (f"<h3>{subject}</h3><p>{lead}</p><table>{rows}</table>"
             f"<p><b>Recommended action:</b> {action}</p>"
             f"<p><a href='{link}'>View certificate detail</a></p>")
     return subject, text, html, facts, link
